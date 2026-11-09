@@ -185,7 +185,7 @@ let
                 pass
         gens.sort(key=lambda x: x["generation"])
 
-        st_vfs = os.statvfs("/")
+        st_vfs = os.statvfs("/nix/store")
         root_total_gib = round((st_vfs.f_blocks * st_vfs.f_frsize) / (1024**3), 2)
         root_free_gib = round((st_vfs.f_bavail * st_vfs.f_frsize) / (1024**3), 2)
 
@@ -232,6 +232,8 @@ let
                 hw["psi_cpu_avg"] = P.get("psi_cpu_some", {}).get("avg")
                 hw["psi_mem_avg"] = P.get("psi_mem_some", {}).get("avg")
                 hw["psi_io_avg"] = P.get("psi_io_some", {}).get("avg")
+                if P.get("nvme_percent_used") is not None:
+                    hw["nvme_percent_used"] = P.get("nvme_percent_used")
         except Exception as e:
             hw["telemetry_query_error"] = str(e)
 
@@ -625,7 +627,7 @@ in
       pkgs.vulnix
     ];
 
-    services.journald.extraConfig = "SystemMaxUse=${cfg.clean.journalMaxUse}";
+    services.journald.settings.Journal.SystemMaxUse = cfg.clean.journalMaxUse;
 
     services.btrfs.autoScrub = lib.mkIf cfg.clean.btrfsAutoScrub {
       enable = true;

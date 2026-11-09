@@ -31,10 +31,25 @@ let
     import socket
     import sqlite3
     import struct
+    import subprocess
     import threading
     import time
     import urllib.parse
     import urllib.request
+
+    NVME_PERCENT_USED = None
+
+    def refresh_nvme_smart():
+        global NVME_PERCENT_USED
+        try:
+            r = subprocess.run(
+                ["${pkgs.nvme-cli}/bin/nvme", "smart-log", "/dev/nvme0", "-o", "json"],
+                capture_output=True, text=True, timeout=5
+            )
+            if r.returncode == 0 and r.stdout:
+                NVME_PERCENT_USED = json.loads(r.stdout).get("percent_used")
+        except Exception:
+            pass
 
     DB_DIR = "/var/lib/laptop-telemetry"
     DB_PATH = "/var/lib/laptop-telemetry/telemetry.db"
@@ -608,6 +623,7 @@ let
                 "cpu_temp_c": {"avg": round(row[38] or 0, 1), "max": round(row[39] or 0, 1), "throttle_ceiling": 97.0},
                 "throttled_ever": {"thermal": bool(row[40]), "prochot": bool(row[41]), "power_limit": bool(row[42])},
                 "battery_health_pct": round(row[43] or 0, 1),
+                "nvme_percent_used": NVME_PERCENT_USED,
             },
             "apps": apps,
             "browser_tabs": tabs,
@@ -793,6 +809,7 @@ let
                 conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
                 conn.commit()
                 enforce_private_permissions()
+                refresh_nvme_smart()
                 last_prune_ts = now
 
             cur_jiff = read_cpu_jiffies()
