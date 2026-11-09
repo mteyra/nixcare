@@ -627,7 +627,10 @@ in
       pkgs.vulnix
     ];
 
-    services.journald.settings.Journal.SystemMaxUse = cfg.clean.journalMaxUse;
+    environment.etc."systemd/journald.conf.d/nixcare.conf".text = ''
+      [Journal]
+      SystemMaxUse=${cfg.clean.journalMaxUse}
+    '';
 
     services.btrfs.autoScrub = lib.mkIf cfg.clean.btrfsAutoScrub {
       enable = true;
