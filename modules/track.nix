@@ -39,11 +39,48 @@ let
 
     NVME_PERCENT_USED = None
 
+    def detect_cpu_turbos():
+        max_khz = 0
+        for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq"):
+            try:
+                with open(p) as f:
+                    khz = int(f.read().strip())
+                    if khz > max_khz:
+                        max_khz = khz
+            except Exception:
+                pass
+        if max_khz > 0:
+            single = max_khz / 1000.0
+            allcore = round(single * 0.92, 0)
+        else:
+            single, allcore = 4000.0, 3600.0
+        return single, allcore
+
+    def find_primary_disk():
+        for d in ("nvme0n1", "sda", "vda", "nvme1n1", "mmcblk0"):
+            if os.path.exists(f"/sys/block/{d}/stat"):
+                return d
+        for p in glob.glob("/sys/block/*"):
+            b = os.path.basename(p)
+            if not b.startswith(("loop", "ram", "zram")):
+                return b
+        return "nvme0n1"
+
+    PRIMARY_DISK = find_primary_disk()
+    CPU_SINGLE_TURBO_MHZ, CPU_ALLCORE_TURBO_MHZ = detect_cpu_turbos()
+
     def refresh_nvme_smart():
         global NVME_PERCENT_USED
+        nvme_ctrl = "/dev/nvme0"
+        if not os.path.exists(nvme_ctrl):
+            ctrls = glob.glob("/dev/nvme[0-9]*")
+            if ctrls:
+                nvme_ctrl = ctrls[0]
+            else:
+                return
         try:
             r = subprocess.run(
-                ["${pkgs.nvme-cli}/bin/nvme", "smart-log", "/dev/nvme0", "-o", "json"],
+                ["${pkgs.nvme-cli}/bin/nvme", "smart-log", nvme_ctrl, "-o", "json"],
                 capture_output=True, text=True, timeout=5
             )
             if r.returncode == 0 and r.stdout:
@@ -57,8 +94,6 @@ let
     RETENTION_DAYS = ${toString cfg.track.retentionDays}
     PORT = 5601
     SAMPLE_INTERVAL = 5.0
-    CPU_ALLCORE_TURBO_MHZ = 3900.0
-    CPU_SINGLE_TURBO_MHZ = 4200.0
     GPU_MAX_MHZ = 1150.0
 
     SCHEMA = """
@@ -226,7 +261,7 @@ let
 
     def read_rapl_uj():
         res = {}
-        for d in glob.glob("/sys/class/powercap/intel-rapl:0*"):
+        for d in glob.glob("/sys/class/powercap/*rapl*"):
             name = read_text(os.path.join(d, "name"))
             uj = read_int(os.path.join(d, "energy_uj"), -1)
             if name and uj >= 0:
@@ -235,15 +270,21 @@ let
 
     def read_temps():
         cpu_t = 0.0
-        nvme_t = 0.0
+        disk_t = 0.0
         for tz in glob.glob("/sys/class/thermal/thermal_zone*"):
-            ttype = read_text(os.path.join(tz, "type"))
+            ttype = read_text(os.path.join(tz, "type")).lower()
             temp = read_int(os.path.join(tz, "temp"), 0) / 1000.0
-            if ttype == "x86_pkg_temp":
-                cpu_t = temp
-            elif ttype == "SSD0":
-                nvme_t = temp
-        return cpu_t, nvme_t
+            if any(k in ttype for k in ("x86_pkg_temp", "k10temp", "coretemp", "cpu")):
+                if temp > cpu_t:
+                    cpu_t = temp
+            elif any(k in ttype for k in ("ssd", "nvme", "drive")):
+                disk_t = temp
+        if cpu_t == 0.0:
+            for hw in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
+                t = read_int(hw, 0) / 1000.0
+                if 20.0 < t < 115.0 and t > cpu_t:
+                    cpu_t = t
+        return cpu_t, disk_t
 
     def read_mem():
         info = {}
@@ -286,8 +327,8 @@ let
             "zswap_mib": zswap_kib / 1024.0,
         }
 
-    def read_nvme_stat():
-        s = read_text("/sys/block/nvme0n1/stat")
+    def read_primary_disk_stat():
+        s = read_text(f"/sys/block/{PRIMARY_DISK}/stat")
         if not s:
             return None
         vals = [int(x) for x in s.split()]
@@ -795,7 +836,7 @@ let
         last_prune_ts = 0.0
         prev_jiff = read_cpu_jiffies()
         prev_rapl = read_rapl_uj()
-        prev_nvme = read_nvme_stat()
+        prev_nvme = read_primary_disk_stat()
         prev_procs, prev_drm = scan_processes()
 
         while True:
@@ -814,7 +855,7 @@ let
 
             cur_jiff = read_cpu_jiffies()
             cur_rapl = read_rapl_uj()
-            cur_nvme = read_nvme_stat()
+            cur_nvme = read_primary_disk_stat()
             cur_procs, cur_drm = scan_processes()
 
             cpu_busy_pct = 0.0
@@ -935,11 +976,20 @@ let
                     power_profile = line.split("=", 1)[1].strip()
             epp = read_text("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference", "")
 
-            bat_pct = read_float("/sys/class/power_supply/BAT0/capacity", 0.0)
-            bat_watts = read_int("/sys/class/power_supply/BAT0/power_now", 0) / 1e6
-            efull = read_float("/sys/class/power_supply/BAT0/energy_full", 0.0)
-            edesign = read_float("/sys/class/power_supply/BAT0/energy_full_design", 54060000.0)
-            bat_health_pct = (efull / edesign * 100.0) if edesign > 0 else 0.0
+            bat_pct = 100.0
+            bat_watts = 0.0
+            bat_health_pct = 100.0
+            bats = glob.glob("/sys/class/power_supply/BAT*")
+            if bats:
+                bdir = bats[0]
+                bat_pct = read_float(os.path.join(bdir, "capacity"), 100.0)
+                bat_watts = read_int(os.path.join(bdir, "power_now"), 0) / 1e6
+                efull = read_float(os.path.join(bdir, "energy_full"), 0.0)
+                edesign = read_float(os.path.join(bdir, "energy_full_design"), 0.0)
+                if efull == 0.0:
+                    efull = read_float(os.path.join(bdir, "charge_full"), 0.0)
+                    edesign = read_float(os.path.join(bdir, "charge_full_design"), 0.0)
+                bat_health_pct = (efull / edesign * 100.0) if edesign > 0 else 100.0
 
             active_app, active_title, fb_domain, fb_tab = query_hyprland()
             afk, aw_domain, aw_url, aw_tab_title, aw_audible, aw_tab_count = query_activitywatch()
@@ -1029,24 +1079,24 @@ let
         print(" Power profile: %s (EPP=%s, AC=%s)  |  Battery health: %s%%" % (
             L.get("power_profile", "?"), L.get("epp", "?"), L.get("ac_online", 0), P["battery_health_pct"]))
         print("-" * 78)
-        print(" HARDWARE POTENTIAL UTILIZATION (How much of your laptop ceiling you use)")
-        print("  CPU True Compute (vs 3.9GHz 4C/8T) : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+        print(" HARDWARE POTENTIAL UTILIZATION (System capacity & workload ceilings)")
+        print("  CPU True Compute (vs all-core ceiling) : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
             L.get("cpu_potential_pct", 0), P["cpu_true_potential"]["avg"], P["cpu_true_potential"]["p95"], P["cpu_true_potential"]["max"]))
-        print("  CPU Thread Busy (all 8 threads)    : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+        print("  CPU Thread Busy (all active threads)   : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
             L.get("cpu_busy_pct", 0), P["cpu_busy"]["avg"], P["cpu_busy"]["p95"], P["cpu_busy"]["max"]))
-        print("  CPU Busiest Single Thread (1T max) : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+        print("  CPU Busiest Single Thread (1T max)     : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
             L.get("cpu_max_thread_pct", 0), P["cpu_single_thread"]["avg"], P["cpu_single_thread"]["p95"], P["cpu_single_thread"]["max"]))
-        print("  CPU Clocks (ceiling 4200 MHz)      : cur %5.0f MHz | avg %5.0f MHz | peak %5.0f MHz" % (
+        print("  CPU Clocks (peak recorded / ceiling)   : cur %5.0f MHz | avg %5.0f MHz | peak %5.0f MHz" % (
             L.get("cpu_avg_mhz", 0), P["cpu_freq_mhz"]["avg"], P["cpu_freq_mhz"]["max"]))
-        print("  GPU 3D/Render (UHD 620 compositor) : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+        print("  GPU 3D/Render (Compositor & 3D engine) : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
             L.get("gpu_render_pct", 0), P["gpu_render"]["avg"], P["gpu_render"]["p95"], P["gpu_render"]["max"]))
-        print("  GPU Video Decode (VA-API QuickSync): cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+        print("  GPU Video Decode (Hardware Acceleration): cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
             L.get("gpu_video_pct", 0), P["gpu_video_decode"]["avg"], P["gpu_video_decode"]["p95"], P["gpu_video_decode"]["max"]))
-        print("  RAM Used (of 15.5 GiB usable)      : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%% (min avail %.0f MiB)" % (
+        print("  RAM Used (excl. reclaimable cache)     : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%% (min avail %.0f MiB)" % (
             L.get("mem_used_pct", 0), P["ram_pct"]["avg"], P["ram_pct"]["p95"], P["ram_pct"]["max"], P["ram_avail_min_mib"]))
-        print("  Compressed Swap (zram / zswap)     : zram %.0f->%.0f MiB | zswap %.0f MiB" % (
+        print("  Compressed Swap (zram / zswap)         : zram %.0f->%.0f MiB | zswap %.0f MiB" % (
             L.get("zram_orig_mib", 0), L.get("zram_compr_mib", 0), L.get("zswap_mib", 0)))
-        print("  NVMe Disk Busy & Write Rate        : busy avg %4.1f%% (peak %4.1f%%) | write avg %6.1f KiB/s (peak %6.1f KiB/s)" % (
+        print("  Disk Busy & Write Rate (Primary Drive) : busy avg %4.1f%% (peak %4.1f%%) | write avg %6.1f KiB/s (peak %6.1f KiB/s)" % (
             P["nvme_busy_pct"]["avg"], P["nvme_busy_pct"]["max"], P["nvme_write_kibs"]["avg"], P["nvme_write_kibs"]["max"]))
         print("  Package Power & Thermal Headroom   : %4.1f W (avg %4.1f W, peak %4.1f W / 44W) | %4.0f C (peak %4.0f C / 97 C)" % (
             L.get("pkg_watts", 0), P["pkg_watts"]["avg"], P["pkg_watts"]["max"], L.get("cpu_temp_c", 0), P["cpu_temp_c"]["max"]))

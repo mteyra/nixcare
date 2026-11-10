@@ -518,7 +518,10 @@ in
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "haunted";
+      default = if config.users.users ? haunted then "haunted"
+                else let
+                  normalUsers = builtins.filter (u: config.users.users.''${u}.isNormalUser) (builtins.attrNames config.users.users);
+                in if normalUsers != [] then builtins.head normalUsers else "root";
       description = "Primary desktop user who owns private telemetry files and receives desktop notifications.";
     };
 
