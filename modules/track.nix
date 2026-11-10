@@ -2,6 +2,7 @@
 
 let
   cfg = config.services.nixcare;
+  intersectorCode = builtins.readFile ./activity_intersector.py;
 
   awatcherStart = pkgs.writeShellScript "awatcher-hyprland-start" ''
     set -u
@@ -18,7 +19,7 @@ let
       ${pkgs.curl}/bin/curl -fsS http://127.0.0.1:5600/api/0/info >/dev/null 2>&1 && break
       sleep 0.5
     done
-    exec ${pkgs.awatcher}/bin/awatcher
+    exec ${pkgs.awatcher}/bin/awatcher --idle-timeout 180
   '';
 
   collectorPy = pkgs.writeText "laptop-telemetry-daemon.py" ''
@@ -36,6 +37,9 @@ let
     import time
     import urllib.parse
     import urllib.request
+    from datetime import datetime, timezone
+
+    ${intersectorCode}
 
     NVME_PERCENT_USED = None
 
@@ -509,7 +513,9 @@ let
         return afk, domain, url, tab_title, audible, tab_count
 
     def build_summary(conn, hours=24.0):
-        since = int(time.time() - hours * 3600)
+        now_ts = time.time()
+        since = int(now_ts - hours * 3600.0)
+        window_duration = hours * 3600.0
         cur = conn.cursor()
         cur.execute("""
           SELECT
@@ -554,33 +560,31 @@ let
             r = cur.fetchone()
             return float(r[0] or 0.0) if r else 0.0
 
+        # Query hardware cost per app from samples
+        app_stats = {}
         cur.execute("""
           SELECT
             CASE WHEN LENGTH(active_app) = 0 THEN "(unfocused/desktop)" ELSE active_app END AS app,
-            SUM(dt) AS sec,
-            AVG(cpu_busy_pct) AS avg_cpu,
-            AVG(cpu_potential_pct) AS avg_pot,
-            AVG(gpu_render_pct + gpu_video_pct) AS avg_gpu,
-            AVG(pkg_watts) AS avg_watts,
-            AVG(disk_write_kibs) AS avg_wkibs
+            AVG(cpu_busy_pct),
+            AVG(cpu_potential_pct),
+            AVG(gpu_render_pct + gpu_video_pct),
+            AVG(pkg_watts),
+            AVG(disk_write_kibs)
           FROM samples
           WHERE ts >= ? AND afk = 0
           GROUP BY app
-          ORDER BY sec DESC
-          LIMIT 20
         """, (since,))
-        apps = [
-            {
-                "app": r[0], "seconds": round(r[1] or 0, 1),
-                "avg_cpu_pct": round(r[2] or 0, 1),
-                "avg_cpu_potential_pct": round(r[3] or 0, 1),
-                "avg_gpu_pct": round(r[4] or 0, 1),
-                "avg_watts": round(r[5] or 0, 2),
-                "avg_write_kibs": round(r[6] or 0, 1),
+        for r in cur.fetchall():
+            app_stats[r[0]] = {
+                "avg_cpu_pct": round(r[1] or 0.0, 1),
+                "avg_cpu_potential_pct": round(r[2] or 0.0, 1),
+                "avg_gpu_pct": round(r[3] or 0.0, 1),
+                "avg_watts": round(r[4] or 0.0, 2),
+                "avg_write_kibs": round(r[5] or 0.0, 1),
             }
-            for r in cur.fetchall()
-        ]
 
+        # Query hardware cost per browser site from samples (ONLY when active_app was actually a browser)
+        site_stats = {}
         cur.execute("""
           SELECT
             CASE
@@ -588,32 +592,158 @@ let
               WHEN LENGTH(browser_tab_title) > 0 THEN browser_tab_title
               ELSE active_title
             END AS site,
-            browser_tab_title,
-            SUM(dt) AS sec,
-            AVG(cpu_busy_pct) AS avg_cpu,
-            AVG(gpu_render_pct + gpu_video_pct) AS avg_gpu,
-            AVG(pkg_watts) AS avg_watts,
-            SUM(CASE WHEN browser_audible=1 THEN dt ELSE 0 END) AS audible_sec
+            AVG(cpu_busy_pct),
+            AVG(gpu_render_pct + gpu_video_pct),
+            AVG(pkg_watts)
           FROM samples
-          WHERE ts >= ? AND afk = 0
-            AND (LOWER(active_app) IN ("firefox", "navigator", "google-chrome", "chromium") OR LENGTH(browser_domain) > 0)
+          WHERE ts >= ? AND afk = 0 AND LOWER(active_app) IN ("firefox", "navigator", "google-chrome", "chromium", "chrome", "brave")
           GROUP BY site
-          ORDER BY sec DESC
-          LIMIT 25
         """, (since,))
-        tabs = [
-            {
-                "site": r[0] or "(browser)",
-                "title": r[1] or "",
-                "seconds": round(r[2] or 0, 1),
-                "avg_cpu_pct": round(r[3] or 0, 1),
-                "avg_gpu_pct": round(r[4] or 0, 1),
-                "avg_watts": round(r[5] or 0, 2),
-                "audible_seconds": round(r[6] or 0, 1),
+        for r in cur.fetchall():
+            site_stats[r[0]] = {
+                "avg_cpu_pct": round(r[1] or 0.0, 1),
+                "avg_gpu_pct": round(r[2] or 0.0, 1),
+                "avg_watts": round(r[3] or 0.0, 2),
             }
-            for r in cur.fetchall()
-        ]
 
+        # Authoritative ActivityWatch clipping and interval intersection
+        start_iso = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = datetime.fromtimestamp(now_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        aw_summary = None
+        try:
+            req = urllib.request.Request("http://127.0.0.1:5600/api/0/buckets/", headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=0.8) as resp:
+                buckets = json.loads(resp.read().decode("utf-8"))
+
+            afk_bucket = next((b for b in buckets if b.startswith("aw-watcher-afk")), None)
+            window_bucket = next((b for b in buckets if b.startswith("aw-watcher-window")), None)
+            web_buckets = [b for b in buckets if b.startswith("aw-watcher-web")]
+
+            def fetch_events(bid):
+                u = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bid) + "/events?start=" + start_iso + "&end=" + end_iso + "&limit=-1"
+                req_b = urllib.request.Request(u, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(req_b, timeout=1.5) as r:
+                    return json.loads(r.read().decode("utf-8"))
+
+            afk_events = fetch_events(afk_bucket) if afk_bucket else []
+            window_events = fetch_events(window_bucket) if window_bucket else []
+            web_by_browser = {}
+            for wb in web_buckets:
+                wb_l = wb.lower()
+                b_key = "firefox" if "firefox" in wb_l else ("chrome" if "chrome" in wb_l else "web")
+                web_by_browser.setdefault(b_key, []).extend(fetch_events(wb))
+
+            aw_summary = compute_screen_time_summary(
+                afk_events=afk_events,
+                window_events=window_events,
+                web_events_by_browser=web_by_browser,
+                window_start=since,
+                window_end=now_ts,
+            )
+        except Exception:
+            aw_summary = None
+
+        if aw_summary and (aw_summary.get("total_tracked_seconds", 0) > 0 or aw_summary.get("active_screen_seconds", 0) > 0):
+            total_tracked_seconds = aw_summary["total_tracked_seconds"]
+            active_screen_seconds = aw_summary["active_screen_seconds"]
+
+            apps = []
+            for a in aw_summary["apps"]:
+                st = app_stats.get(a["app"], {})
+                apps.append({
+                    "app": a["app"],
+                    "seconds": a["seconds"],
+                    "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
+                    "avg_cpu_potential_pct": st.get("avg_cpu_potential_pct", 0.0),
+                    "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
+                    "avg_watts": st.get("avg_watts", 0.0),
+                    "avg_write_kibs": st.get("avg_write_kibs", 0.0),
+                })
+
+            tabs = []
+            for t in aw_summary["browser_tabs"]:
+                st = site_stats.get(t["site"], {})
+                tabs.append({
+                    "site": t["site"],
+                    "title": t.get("title", ""),
+                    "seconds": t["seconds"],
+                    "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
+                    "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
+                    "avg_watts": st.get("avg_watts", 0.0),
+                    "audible_seconds": t.get("audible_seconds", 0.0),
+                })
+        else:
+            # Fallback path if ActivityWatch is unreachable: query SQLite with strict clipping and invariants
+            cur.execute("""
+              SELECT
+                ts, dt, afk, active_app, browser_domain, browser_tab_title, browser_audible
+              FROM samples
+              WHERE ts >= ?
+              ORDER BY ts ASC
+            """, (since,))
+            sample_rows = cur.fetchall()
+
+            total_tracked_raw = 0.0
+            active_screen_raw = 0.0
+            app_durations = {}
+            site_durations = {}
+            site_audible_durs = {}
+            site_titles = {}
+
+            for r in sample_rows:
+                r_ts, r_dt, r_afk, r_app, r_domain, r_title, r_audible = r
+                effective_dt = min(15.0, min(float(r_dt or 0.0), max(0.0, float(r_ts - since))))
+                if effective_dt <= 0:
+                    continue
+                total_tracked_raw += effective_dt
+                if r_afk == 0:
+                    active_screen_raw += effective_dt
+                    app_name = r_app or "(unfocused/desktop)"
+                    app_durations[app_name] = app_durations.get(app_name, 0.0) + effective_dt
+
+                    if is_browser_app(r_app):
+                        site = r_domain or r_title or "(browser)"
+                        site_durations[site] = site_durations.get(site, 0.0) + effective_dt
+                        site_titles[site] = r_title or ""
+                        if r_audible == 1:
+                            site_audible_durs[site] = site_audible_durs.get(site, 0.0) + effective_dt
+
+            total_tracked_seconds = min(window_duration, total_tracked_raw)
+            active_screen_seconds = min(total_tracked_seconds, active_screen_raw)
+
+            apps = []
+            for app, sec in sorted(app_durations.items(), key=lambda x: x[1], reverse=True)[:20]:
+                st = app_stats.get(app, {})
+                apps.append({
+                    "app": app,
+                    "seconds": round(sec, 1),
+                    "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
+                    "avg_cpu_potential_pct": st.get("avg_cpu_potential_pct", 0.0),
+                    "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
+                    "avg_watts": st.get("avg_watts", 0.0),
+                    "avg_write_kibs": st.get("avg_write_kibs", 0.0),
+                })
+
+            tabs = []
+            browser_focus_sec = sum(sec for app, sec in app_durations.items() if is_browser_app(app))
+            sum_sites_raw = sum(site_durations.values())
+            scale = (browser_focus_sec / sum_sites_raw) if sum_sites_raw > browser_focus_sec > 0 else 1.0
+
+            for site, sec in sorted(site_durations.items(), key=lambda x: x[1], reverse=True)[:25]:
+                st = site_stats.get(site, {})
+                adj_sec = round(sec * scale, 1)
+                tabs.append({
+                    "site": site,
+                    "title": site_titles.get(site, ""),
+                    "seconds": adj_sec,
+                    "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
+                    "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
+                    "avg_watts": st.get("avg_watts", 0.0),
+                    "audible_seconds": round(site_audible_durs.get(site, 0.0), 1),
+                })
+
+        # Top processes
         cur.execute("""
           SELECT top_cpu_comm, COUNT(*), AVG(top_cpu_pct), MAX(top_cpu_pct)
           FROM samples WHERE ts >= ? AND LENGTH(top_cpu_comm) > 0
@@ -637,8 +767,8 @@ let
         return {
             "window_hours": hours,
             "sample_count": n,
-            "total_tracked_seconds": round(row[1] or 0, 1),
-            "active_screen_seconds": round(row[2] or 0, 1),
+            "total_tracked_seconds": round(total_tracked_seconds, 1),
+            "active_screen_seconds": round(active_screen_seconds, 1),
             "latest": latest,
             "potential": {
                 "cpu_busy": {"avg": round(row[3] or 0, 1), "p95": round(p95("cpu_busy_pct"), 1), "max": round(row[4] or 0, 1)},
@@ -842,7 +972,7 @@ let
         while True:
             time.sleep(SAMPLE_INTERVAL)
             now = time.time()
-            dt = max(0.5, now - prev_ts)
+            dt = min(15.0, max(0.5, now - prev_ts))
 
             # Daily retention prune + permission enforcement
             if now - last_prune_ts >= 3600.0:
@@ -994,8 +1124,12 @@ let
             active_app, active_title, fb_domain, fb_tab = query_hyprland()
             afk, aw_domain, aw_url, aw_tab_title, aw_audible, aw_tab_count = query_activitywatch()
 
-            browser_domain = aw_domain if aw_domain else fb_domain
-            browser_tab_title = aw_tab_title if aw_tab_title else fb_tab
+            is_browser = is_browser_app(active_app)
+            browser_domain = (aw_domain if aw_domain else fb_domain) if is_browser else ""
+            browser_tab_title = (aw_tab_title if aw_tab_title else fb_tab) if is_browser else ""
+            browser_url_val = aw_url if is_browser else ""
+            browser_audible_val = aw_audible if is_browser else 0
+            browser_tab_cnt_val = aw_tab_count if is_browser else 0
 
             row_vals = (
                 int(now), round(dt, 2),
@@ -1019,7 +1153,7 @@ let
                 ac_online, power_profile, epp,
                 round(bat_pct, 1), round(bat_watts, 2), round(bat_health_pct, 1),
                 afk, active_app, active_title,
-                browser_domain, aw_url, browser_tab_title, aw_audible, aw_tab_count
+                browser_domain, browser_url_val, browser_tab_title, browser_audible_val, browser_tab_cnt_val
             )
             placeholders = ",".join(["?"] * len(row_vals))
             conn.execute("INSERT OR REPLACE INTO samples VALUES (" + placeholders + ")", row_vals)
