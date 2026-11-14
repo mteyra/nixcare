@@ -27,6 +27,8 @@ jobs:
           nix run . -- --version
           nix run . -- --help
           nix run . -- optimise --dry-run
+      - name: Verify Home Manager arguments and platform branches
+        run: nix-instantiate --eval --strict --json test/home-manager-module.nix
       - name: Exercise real Git and Nix input isolation
         run: NIXCARE_INTEGRATION=1 python3 -m unittest discover -s test -p 'test_portable_integration.py' -v
   nixos:

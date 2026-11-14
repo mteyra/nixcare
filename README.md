@@ -40,7 +40,7 @@ nix --extra-experimental-features 'nix-command flakes' run github:mteyra/nixcare
 Older Nix versions call `nix profile add` **`nix profile install`**. For a traditional installation using your configured `<nixpkgs>`:
 
 ```sh
-nix-env -if https://github.com/mteyra/nixcare/archive/refs/tags/v0.2.0.tar.gz
+nix-env -if https://github.com/mteyra/nixcare/archive/refs/tags/v0.2.1.tar.gz
 nixcare doctor
 ```
 
@@ -102,7 +102,7 @@ Your next login picks up the `nixcare` group used to read system reports. Until 
 | Full update build | Off; enable it to prepare a candidate weekly |
 | Hardware/activity tracking | Off; separate, explicit opt-ins |
 
-Heavy scheduled jobs have low CPU/I/O priority and wait for AC power by default. If the machine is on battery or another maintenance job is running, they retry every **15 minutes**. Ordinary failures stay visible and are not automatically retried. Weekly schedules and their randomized delays remain in place; timers catch up after downtime. [Inspect or cancel a pending retry](docs/options.md#scheduled-maintenance-and-retries).
+Heavy scheduled jobs have low CPU/I/O priority and wait for AC power by default. Before starting, they also check available memory, CPU load, and memory/I/O pressure; vulnerability scans use the same resource check. If resources are busy, the machine is on battery, or another maintenance job is running, deferred work retries every **15 minutes**. This check does not pause work if your workload grows afterward. Ordinary failures stay visible and are not automatically retried. [Inspect or cancel a pending retry](docs/options.md#scheduled-maintenance-and-retries).
 
 Nixcare does not automatically tune your CPU, change power profiles, or switch your system to an update.
 
@@ -176,7 +176,7 @@ nix profile list
 nix profile upgrade nixcare
 ```
 
-For a declarative installation, update the `nixcare` flake input and rebuild. To pin a release, use `github:mteyra/nixcare/v0.2.0` as the input URL; change that tag deliberately when upgrading. [Disable, uninstall, and rollback instructions](docs/options.md#disable-or-remove).
+For a declarative installation, update the `nixcare` flake input and rebuild. To pin a release, use `github:mteyra/nixcare/v0.2.1` as the input URL; change that tag deliberately when upgrading. [Disable, uninstall, and rollback instructions](docs/options.md#disable-or-remove).
 
 ## New to Nix?
 

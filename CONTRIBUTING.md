@@ -39,6 +39,7 @@ These require a writable Nix store and are skipped in the default sandboxed unit
 | `modules/track.nix` | Optional collector, dashboard, and desktop integration |
 | `modules/activity_intersector.py` | Clipped, non-overlapping screen-time accounting |
 | `modules/tracking_support.py` | Local HTTP request boundaries and bounded summary caching |
+| `modules/schedule_guard.py` | Small Linux resource checks before scheduled heavy work |
 | `test/` | Behavior and regression tests |
 | `website/` | Static public website, deployed by GitHub Pages |
 

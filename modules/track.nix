@@ -349,12 +349,12 @@ let
             "io_ticks_ms": vals[9],
         }
 
-    def scan_processes():
+    def scan_processes(proc_root="/proc"):
         clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
         page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
         procs = {}
         drm_clients = {}
-        for entry in os.scandir("/proc"):
+        for entry in os.scandir(proc_root):
             if not entry.name.isdigit():
                 continue
             pid = int(entry.name)
@@ -395,12 +395,16 @@ let
                 "start_ticks": start_ticks,
             }
 
-            fdinfo_dir = pdir + "/fdinfo"
             try:
-                for fde in os.scandir(fdinfo_dir):
+                for fde in os.scandir(pdir + "/fd"):
                     try:
-                        with open(fde.path, "r") as ff:
-                            head = ff.read(512)
+                        device = os.readlink(fde.path)
+                        if not device.startswith("/dev/dri/"):
+                            continue
+                        # Browser sockets and regular files need no fdinfo read.
+                        # DRM fields can extend beyond the first 512 bytes.
+                        with open(pdir + "/fdinfo/" + fde.name, "r") as ff:
+                            head = ff.read(4096)
                         if "drm-client-id:" not in head:
                             continue
                         cid = None
@@ -410,14 +414,18 @@ let
                         for line in head.splitlines():
                             if line.startswith("drm-client-id:"):
                                 cid = line.split(":", 1)[1].strip()
+                            elif line.startswith("drm-pdev:"):
+                                device = line.split(":", 1)[1].strip()
                             elif line.startswith("drm-engine-render:"):
                                 render_ns = int(line.split(":", 1)[1].split()[0])
                             elif line.startswith("drm-engine-video:") or line.startswith("drm-engine-video-enhance:"):
                                 video_ns += int(line.split(":", 1)[1].split()[0])
                             elif line.startswith("drm-engine-copy:"):
                                 copy_ns = int(line.split(":", 1)[1].split()[0])
-                        if cid is not None and cid not in drm_clients:
-                            drm_clients[cid] = {
+                        # Client IDs are scoped to a DRM device, not the host.
+                        client_key = (device, cid)
+                        if cid is not None and client_key not in drm_clients:
+                            drm_clients[client_key] = {
                                 "comm": comm,
                                 "pid": pid,
                                 "render_ns": render_ns,
@@ -481,59 +489,61 @@ let
         try:
             req = urllib.request.Request("http://127.0.0.1:5600/api/0/buckets/", headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=0.4) as resp:
-                buckets = json.loads(resp.read().decode("utf-8"))
+                buckets = select_activity_buckets(read_json_bounded(resp), socket.gethostname())
         except Exception:
             return afk, domain, url, tab_title, audible, tab_count
 
-        for bid in buckets:
-            if bid.startswith("aw-watcher-afk"):
-                try:
-                    u = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bid) + "/events?limit=1"
-                    with urllib.request.urlopen(u, timeout=0.3) as r:
-                        evs = json.loads(r.read().decode("utf-8"))
-                        if evs:
-                            st = evs[0].get("data", {}).get("status", "")
-                            # Stale or absent AFK evidence is not active time.
-                            end = parse_iso(evs[0].get("timestamp")) + float(evs[0].get("duration") or 0)
-                            if st == "not-afk" and time.time() - end < 30:
-                                afk = 0
-                except Exception:
-                    pass
+        def latest_event(bucket_id):
+            u = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bucket_id, safe="") + "/events?limit=1"
+            with urllib.request.urlopen(u, timeout=0.3) as response:
+                events = read_json_bounded(response)
+            if not isinstance(events, list) or not events or not isinstance(events[0], dict):
+                return None
+            event = events[0]
+            start = parse_iso(event.get("timestamp"))
+            duration = float(event.get("duration") or 0)
+            end = start + duration
+            # Future, stale, malformed or absent evidence is not active time.
+            if duration < 0 or not math.isfinite(start) or not math.isfinite(end) or not 0 <= time.time() - end < 30:
+                return None
+            return event
 
-        best_ts = ""
+        try:
+            event = latest_event(buckets["afk"]) if "afk" in buckets else None
+            if event and event.get("data", {}).get("status") == "not-afk":
+                afk = 0
+        except Exception:
+            pass
+
         browser_family = next((name for name, apps in BROWSER_FAMILIES.items() if active_app.lower() in apps), None)
-        for bid in buckets:
-            if browser_family and bid.startswith("aw-watcher-web") and browser_family in bid.lower():
-                try:
-                    u = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bid) + "/events?limit=1"
-                    with urllib.request.urlopen(u, timeout=0.3) as r:
-                        evs = json.loads(r.read().decode("utf-8"))
-                        if evs:
-                            ev = evs[0]
-                            end = parse_iso(ev.get("timestamp")) + float(ev.get("duration") or 0)
-                            if time.time() - end >= 30:
-                                continue
-                            ets = ev.get("timestamp", "")
-                            if ets >= best_ts:
-                                best_ts = ets
-                                d = ev.get("data", {})
-                                url = str(d.get("url") or "")
-                                tab_title = str(d.get("title") or "")
-                                audible = 1 if d.get("audible") else 0
-                                tab_count = int(d.get("tabCount") or 0)
-                                try:
-                                    parsed = urllib.parse.urlparse(url)
-                                    domain = parsed.netloc or ""
-                                except Exception:
-                                    domain = ""
-                except Exception:
-                    pass
+        try:
+            event = latest_event(buckets[browser_family]) if browser_family in buckets else None
+            if event:
+                data = event.get("data", {})
+                url = str(data.get("url") or "")
+                tab_title = str(data.get("title") or "")
+                audible = 1 if data.get("audible") else 0
+                tab_count = max(0, int(data.get("tabCount") or 0))
+                domain = extract_site_domain(url)
+        except Exception:
+            pass
         return afk, domain, url, tab_title, audible, tab_count
 
     def build_summary(conn, hours=24.0):
+        # All queries must describe the same samples while the writer is active.
+        own_transaction = not conn.in_transaction
+        if own_transaction:
+            conn.execute("BEGIN")
+        try:
+            return _build_summary(conn, hours)
+        finally:
+            if own_transaction:
+                conn.rollback()
+
+    def _build_summary(conn, hours=24.0):
         hours = validate_hours(hours, RETENTION_DAYS)
         now_ts = time.time()
-        since = int(now_ts - hours * 3600.0)
+        since = now_ts - hours * 3600.0
         window_duration = hours * 3600.0
         cur = conn.cursor()
         cur.execute("""
@@ -561,24 +571,39 @@ let
             AVG(cpu_temp_c), MAX(cpu_temp_c),
             MAX(throttle_thermal), MAX(throttle_prochot), MAX(throttle_pwr),
             AVG(bat_health_pct)
-          FROM samples WHERE ts >= ?
-        """, (since,))
+          FROM samples WHERE ts > ? AND ts <= ?
+        """, (since, now_ts))
         row = cur.fetchone()
         n = row[0] or 0
+        cur.execute("""
+          WITH intervals AS (
+            SELECT ts, MAX(0, MIN(15, COALESCE(dt, 0))) AS duration,
+                   LAG(ts, 1, ?) OVER (ORDER BY ts) AS previous_end
+            FROM samples WHERE ts > ? AND ts <= ?
+          )
+          SELECT COALESCE(SUM(MAX(0, ts - MAX(?, previous_end, ts - duration))), 0)
+          FROM intervals
+        """, (since, since, now_ts, since))
+        hardware_tracked_seconds = min(window_duration, cur.fetchone()[0])
 
-        cur.execute("SELECT * FROM samples ORDER BY ts DESC LIMIT 1")
+        cur.execute("SELECT * FROM samples WHERE ts > ? AND ts <= ? ORDER BY ts DESC LIMIT 1", (since, now_ts))
         latest_row = cur.fetchone()
         cols = [d[0] for d in cur.description] if cur.description else []
         latest = dict(zip(cols, latest_row)) if latest_row else {}
-        if not ACTIVITY_ENABLED:
+        if latest and not ACTIVITY_ENABLED:
             for key in ("active_app", "active_title", "browser_domain", "browser_url", "browser_tab_title"):
                 latest[key] = ""
 
         def p95(col):
             if n == 0:
                 return 0.0
-            offset = max(0, int(n * 0.95) - 1)
-            cur.execute("SELECT " + col + " FROM samples WHERE ts >= ? ORDER BY " + col + " ASC LIMIT 1 OFFSET ?", (since, offset))
+            # Nearest-rank percentile over available readings, ignoring NULL.
+            cur.execute("SELECT COUNT(" + col + ") FROM samples WHERE ts > ? AND ts <= ?", (since, now_ts))
+            count = cur.fetchone()[0]
+            if not count:
+                return 0.0
+            offset = max(0, math.ceil(count * 0.95) - 1)
+            cur.execute("SELECT " + col + " FROM samples WHERE ts > ? AND ts <= ? AND " + col + " IS NOT NULL ORDER BY " + col + " ASC LIMIT 1 OFFSET ?", (since, now_ts, offset))
             r = cur.fetchone()
             return float(r[0] or 0.0) if r else 0.0
 
@@ -593,10 +618,10 @@ let
             AVG(pkg_watts),
             AVG(disk_write_kibs)
           FROM samples
-          WHERE ts >= ? AND afk = 0
+          WHERE ts > ? AND ts <= ? AND afk = 0
           GROUP BY app
-        """, (since,))
-        for r in cur.fetchall():
+        """, (since, now_ts))
+        for r in cur:
             app_stats[r[0]] = {
                 "avg_cpu_pct": round(r[1] or 0.0, 1),
                 "avg_cpu_potential_pct": round(r[2] or 0.0, 1),
@@ -618,10 +643,10 @@ let
             AVG(gpu_render_pct + gpu_video_pct),
             AVG(pkg_watts)
           FROM samples
-          WHERE ts >= ? AND afk = 0 AND LOWER(active_app) IN ("firefox", "navigator", "google-chrome", "chromium", "chrome", "brave")
+          WHERE ts > ? AND ts <= ? AND afk = 0 AND LOWER(active_app) IN ("firefox", "navigator", "google-chrome", "chromium", "chrome", "brave")
           GROUP BY site
-        """, (since,))
-        for r in cur.fetchall():
+        """, (since, now_ts))
+        for r in cur:
             site_stats[r[0]] = {
                 "avg_cpu_pct": round(r[1] or 0.0, 1),
                 "avg_gpu_pct": round(r[2] or 0.0, 1),
@@ -629,34 +654,46 @@ let
             }
 
         # Authoritative ActivityWatch clipping and interval intersection
-        start_iso = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_iso = datetime.fromtimestamp(now_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        start_iso = datetime.fromtimestamp(since, timezone.utc).isoformat()
+        end_iso = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
 
         aw_summary = None
+        activity_warning = None
+        aw_deadline = time.monotonic() + 5.0
+        def read_activity(url):
+            remaining = aw_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("ActivityWatch query budget exceeded")
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=min(1.5, remaining)) as response:
+                return read_json_bounded(response)
         try:
             if not ACTIVITY_ENABLED:
                 raise RuntimeError("Activity tracking disabled")
-            req = urllib.request.Request("http://127.0.0.1:5600/api/0/buckets/", headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=0.8) as resp:
-                buckets = json.loads(resp.read().decode("utf-8"))
-
-            afk_bucket = next((b for b in buckets if b.startswith("aw-watcher-afk")), None)
-            window_bucket = next((b for b in buckets if b.startswith("aw-watcher-window")), None)
-            web_buckets = [b for b in buckets if b.startswith("aw-watcher-web")]
+            buckets = select_activity_buckets(
+                read_activity("http://127.0.0.1:5600/api/0/buckets/"), socket.gethostname())
+            afk_bucket = buckets.get("afk")
+            window_bucket = buckets.get("window")
 
             def fetch_events(bid):
-                u = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bid) + "/events?start=" + start_iso + "&end=" + end_iso + "&limit=-1"
-                req_b = urllib.request.Request(u, headers={"Accept": "application/json"})
-                with urllib.request.urlopen(req_b, timeout=1.5) as r:
-                    return json.loads(r.read().decode("utf-8"))
+                base = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bid, safe="") + "/events?"
+                u = base + urllib.parse.urlencode({"start": start_iso, "end": end_iso, "limit": 20001})
+                events = read_activity(u)
+                if not isinstance(events, list) or len(events) > 20000:
+                    raise ValueError("Activity history exceeds 20000 events; request fewer hours")
+                # Include a spanning event even when the API filters by start time.
+                previous = base + urllib.parse.urlencode({"end": start_iso, "limit": 1})
+                boundary = read_activity(previous)
+                if not isinstance(boundary, list):
+                    raise ValueError("Invalid ActivityWatch boundary response")
+                return boundary[:1] + events
 
             afk_events = fetch_events(afk_bucket) if afk_bucket else []
             window_events = fetch_events(window_bucket) if window_bucket else []
             web_by_browser = {}
-            for wb in web_buckets:
-                wb_l = wb.lower()
-                b_key = "firefox" if "firefox" in wb_l else ("chrome" if "chrome" in wb_l else "web")
-                web_by_browser.setdefault(b_key, []).extend(fetch_events(wb))
+            for browser in BROWSER_FAMILIES:
+                if browser in buckets:
+                    web_by_browser[browser] = fetch_events(buckets[browser])
 
             aw_summary = compute_screen_time_summary(
                 afk_events=afk_events,
@@ -665,10 +702,16 @@ let
                 window_start=since,
                 window_end=now_ts,
             )
-        except Exception:
+            if not aw_summary.get("active_measurement_available", True):
+                raise ValueError("No idle/active evidence in the requested window")
+        except Exception as error:
             aw_summary = None
+            if ACTIVITY_ENABLED:
+                activity_warning = "ActivityWatch unavailable or incomplete; using sampled activity: " + str(error)
 
+        activity_source = "disabled" if not ACTIVITY_ENABLED else "telemetry-samples"
         if aw_summary and (aw_summary.get("total_tracked_seconds", 0) > 0 or aw_summary.get("active_screen_seconds", 0) > 0):
+            activity_source = "activitywatch"
             total_tracked_seconds = aw_summary["total_tracked_seconds"]
             active_screen_seconds = aw_summary["active_screen_seconds"]
 
@@ -678,6 +721,7 @@ let
                 apps.append({
                     "app": a["app"],
                     "seconds": a["seconds"],
+                    "hardware_available": bool(st),
                     "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
                     "avg_cpu_potential_pct": st.get("avg_cpu_potential_pct", 0.0),
                     "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
@@ -692,6 +736,7 @@ let
                     "site": t["site"],
                     "title": t.get("title", ""),
                     "seconds": t["seconds"],
+                    "hardware_available": bool(st),
                     "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
                     "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
                     "avg_watts": st.get("avg_watts", 0.0),
@@ -703,10 +748,9 @@ let
               SELECT
                 ts, dt, afk, active_app, browser_domain, browser_tab_title, browser_audible
               FROM samples
-              WHERE ts >= ?
+              WHERE ts > ? AND ts <= ?
               ORDER BY ts ASC
-            """, (since,))
-            sample_rows = cur.fetchall()
+            """, (since, now_ts))
 
             total_tracked_raw = 0.0
             active_screen_raw = 0.0
@@ -716,7 +760,7 @@ let
             site_titles = {}
 
             previous_end = float(since)
-            for r in sample_rows:
+            for r in cur:
                 r_ts, r_dt, r_afk, r_app, r_domain, r_title, r_audible = r
                 # Clock jumps, repeated samples and suspend must not double-count.
                 end = min(now_ts, float(r_ts))
@@ -747,6 +791,7 @@ let
                 apps.append({
                     "app": app,
                     "seconds": duration_seconds(sec),
+                    "hardware_available": bool(st),
                     "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
                     "avg_cpu_potential_pct": st.get("avg_cpu_potential_pct", 0.0),
                     "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
@@ -766,6 +811,7 @@ let
                     "site": site,
                     "title": site_titles.get(site, ""),
                     "seconds": adj_sec,
+                    "hardware_available": bool(st),
                     "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
                     "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
                     "avg_watts": st.get("avg_watts", 0.0),
@@ -775,9 +821,9 @@ let
         # Top processes
         cur.execute("""
           SELECT top_cpu_comm, COUNT(*), AVG(top_cpu_pct), MAX(top_cpu_pct)
-          FROM samples WHERE ts >= ? AND LENGTH(top_cpu_comm) > 0
+          FROM samples WHERE ts > ? AND ts <= ? AND LENGTH(top_cpu_comm) > 0
           GROUP BY top_cpu_comm ORDER BY SUM(top_cpu_pct) DESC LIMIT 10
-        """, (since,))
+        """, (since, now_ts))
         top_cpu_procs = [
             {"comm": r[0], "samples": r[1], "avg_pct": round(r[2] or 0, 1), "max_pct": round(r[3] or 0, 1)}
             for r in cur.fetchall()
@@ -785,21 +831,28 @@ let
 
         cur.execute("""
           SELECT top_io_comm, COUNT(*), AVG(top_io_write_kibs), MAX(top_io_write_kibs)
-          FROM samples WHERE ts >= ? AND LENGTH(top_io_comm) > 0 AND top_io_write_kibs > 0
+          FROM samples WHERE ts > ? AND ts <= ? AND LENGTH(top_io_comm) > 0 AND top_io_write_kibs > 0
           GROUP BY top_io_comm ORDER BY SUM(top_io_write_kibs) DESC LIMIT 10
-        """, (since,))
+        """, (since, now_ts))
         top_io_procs = [
             {"comm": r[0], "samples": r[1], "avg_kibs": round(r[2] or 0, 1), "max_kibs": round(r[3] or 0, 1)}
             for r in cur.fetchall()
         ]
 
-        return {
+        result = {
             "window_hours": hours,
+            "window_start": since,
+            "window_end": now_ts,
+            "hardware_tracked_seconds": hardware_tracked_seconds,
+            "hardware_coverage_pct": round(100 * hardware_tracked_seconds / window_duration, 2),
             "activity_enabled": ACTIVITY_ENABLED,
+            "activity_source": activity_source,
+            "activity_warning": activity_warning,
+            "aggregation": "Hardware averages and nearest-rank p95 use samples in the requested window.",
             "compute_metric": "Frequency-weighted CPU busy estimate; not benchmarked compute capacity.",
             "sample_count": n,
-            "total_tracked_seconds": round(total_tracked_seconds, 1),
-            "active_screen_seconds": round(active_screen_seconds, 1),
+            "total_tracked_seconds": total_tracked_seconds,
+            "active_screen_seconds": active_screen_seconds,
             "latest": latest,
             "potential": {
                 "cpu_busy": {"avg": round(row[3] or 0, 1), "p95": round(p95("cpu_busy_pct"), 1), "max": round(row[4] or 0, 1)},
@@ -832,6 +885,11 @@ let
             "top_cpu_processes": top_cpu_procs,
             "top_io_processes": top_io_procs,
         }
+        if not n:
+            # Empty windows have no measurements, not measured zero load.
+            for key, value in result["potential"].items():
+                result["potential"][key] = {field: None for field in value} if isinstance(value, dict) else None
+        return result
 
     DASHBOARD_HTML = """<!DOCTYPE html>
     <html lang="en">
@@ -913,9 +971,11 @@ let
           var P = d.potential;
           document.getElementById("status").innerHTML =
             "Samples: <b>" + d.sample_count + "</b> | Active screen time: <b>" + fmtDur(d.active_screen_seconds) + "</b> | " +
+            "Hardware coverage: <b>" + escapeHtml(d.hardware_coverage_pct) + "%</b> | Activity: " + escapeHtml(d.activity_source) + " | " +
             "Profile: <b>" + escapeHtml(L.power_profile || "?") + "</b> (" + escapeHtml(L.epp || "?") + ") | Focused: <b>" + escapeHtml(L.active_app || "none") + "</b> | " +
-            (d.activity_enabled ? 'ActivityWatch: <a href="http://127.0.0.1:5600" target="_blank" rel="noreferrer">127.0.0.1:5600</a>' : "Activity tracking disabled");
-          document.getElementById("gauges").innerHTML =
+            (d.activity_enabled ? 'ActivityWatch: <a href="http://127.0.0.1:5600" target="_blank" rel="noreferrer">127.0.0.1:5600</a>' : "Activity tracking disabled") +
+            (d.activity_warning ? "<br>" + escapeHtml(d.activity_warning) : "");
+          document.getElementById("gauges").innerHTML = !d.sample_count ? '<p>No hardware samples in this window.</p>' :
             '<div class="card">' +
               '<h2>CPU Utilization</h2>' +
               bar("Frequency-weighted busy estimate", (L.cpu_potential_pct||0).toFixed(1), P.cpu_true_potential.avg, P.cpu_true_potential.max) +
@@ -940,9 +1000,11 @@ let
               '<div class="sub">CPU Power: <b>' + (L.pkg_watts||0).toFixed(1) + ' W</b> (avg ' + P.pkg_watts.avg + ' W, peak ' + P.pkg_watts.max + ' W) | Temp: <b>' + (L.cpu_temp_c||0).toFixed(0) + '°C</b> (max ' + P.cpu_temp_c.max + '°C) | Battery Health: <b>' + P.battery_health_pct + '%</b></div>' +
             '</div>';
           document.querySelector("#apps-table tbody").innerHTML = d.apps.map(function(a) {
+            if (a.hardware_available === false) return "<tr><td>" + escapeHtml(a.app) + "</td><td>" + fmtDur(a.seconds) + '</td><td colspan="3">Hardware unavailable</td></tr>';
             return "<tr><td><b>" + escapeHtml(a.app) + "</b></td><td>" + fmtDur(a.seconds) + "</td><td>" + a.avg_cpu_pct + "%</td><td>" + a.avg_gpu_pct + "%</td><td>" + a.avg_watts + "W</td></tr>";
           }).join("");
           document.querySelector("#tabs-table tbody").innerHTML = d.browser_tabs.map(function(t) {
+            if (t.hardware_available === false) return "<tr><td>" + escapeHtml(t.site) + "</td><td>" + fmtDur(t.seconds) + '</td><td colspan="3">Hardware unavailable</td></tr>';
             return '<tr><td title="' + escapeHtml(t.title) + '"><b>' + escapeHtml(t.site.slice(0,48)) + "</b></td><td>" + fmtDur(t.seconds) + "</td><td>" + t.avg_cpu_pct + "%</td><td>" + t.avg_gpu_pct + "%</td><td>" + fmtDur(t.audible_seconds) + "</td></tr>";
           }).join("");
           document.querySelector("#cpu-table tbody").innerHTML = d.top_cpu_processes.map(function(p) {
@@ -990,6 +1052,8 @@ let
                     return
                 def read_summary():
                     conn = sqlite3.connect("file:" + DB_PATH + "?mode=ro", uri=True, timeout=2)
+                    deadline = time.monotonic() + 20
+                    conn.set_progress_handler(lambda: time.monotonic() > deadline, 10000)
                     try:
                         return build_summary(conn, hours)
                     finally:
@@ -1064,7 +1128,7 @@ let
         while True:
             time.sleep(SAMPLE_INTERVAL)
             now = time.time()
-            dt = min(15.0, max(0.5, now - prev_ts))
+            dt = sample_duration(now - prev_ts, SAMPLE_INTERVAL)
 
             # Daily retention prune + permission enforcement
             if now - last_prune_ts >= 3600.0:
@@ -1079,6 +1143,12 @@ let
             cur_rapl = read_rapl_uj()
             cur_nvme = read_primary_disk_stat()
             cur_procs, cur_drm = scan_processes()
+            if dt is None:
+                # Counter deltas spanning suspend or a clock adjustment are not
+                # a 15-second burst of work. Establish a fresh baseline instead.
+                prev_ts, prev_jiff, prev_rapl = now, cur_jiff, cur_rapl
+                prev_nvme, prev_procs, prev_drm = cur_nvme, cur_procs, cur_drm
+                continue
 
             cpu_busy_pct = 0.0
             if "total" in cur_jiff and "total" in prev_jiff:
@@ -1266,6 +1336,7 @@ let
     #!${pkgs.python3}/bin/python3
     import argparse
     import json
+    import math
     import sys
     import urllib.request
 
@@ -1282,10 +1353,12 @@ let
         ap.add_argument("--hours", type=float, default=24.0, help="Lookback window in hours (default: 24)")
         ap.add_argument("--json", action="store_true", help="Print raw JSON summary")
         args = ap.parse_args()
+        if not math.isfinite(args.hours) or not 0 < args.hours <= ${toString cfg.track.retentionDays} * 24:
+            ap.error("--hours must be greater than 0 and at most " + str(${toString cfg.track.retentionDays} * 24))
 
         url = "http://127.0.0.1:5601/api/summary?hours=" + str(args.hours)
         try:
-            with urllib.request.urlopen(url, timeout=3.0) as resp:
+            with urllib.request.urlopen(url, timeout=30.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             print("Error querying laptop-telemetry daemon at " + url + ": " + str(e), file=sys.stderr)
@@ -1302,35 +1375,45 @@ let
         print("=" * 78)
         print(" Samples: %d  |  Tracked: %s  |  Active screen time: %s" % (
             data["sample_count"], fmt_dur(data["total_tracked_seconds"]), fmt_dur(data["active_screen_seconds"])))
-        print(" Power profile: %s (EPP=%s, AC=%s)  |  Battery health: %s%%" % (
-            L.get("power_profile", "?"), L.get("epp", "?"), L.get("ac_online", 0), P["battery_health_pct"]))
-        print("-" * 78)
-        print(" HARDWARE POTENTIAL UTILIZATION (System capacity & workload ceilings)")
-        print("  CPU Frequency-Weighted Busy (estimate): cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
-            L.get("cpu_potential_pct", 0), P["cpu_true_potential"]["avg"], P["cpu_true_potential"]["p95"], P["cpu_true_potential"]["max"]))
-        print("  CPU Thread Busy (all active threads)   : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
-            L.get("cpu_busy_pct", 0), P["cpu_busy"]["avg"], P["cpu_busy"]["p95"], P["cpu_busy"]["max"]))
-        print("  CPU Busiest Single Thread (1T max)     : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
-            L.get("cpu_max_thread_pct", 0), P["cpu_single_thread"]["avg"], P["cpu_single_thread"]["p95"], P["cpu_single_thread"]["max"]))
-        print("  CPU Clocks (peak recorded / ceiling)   : cur %5.0f MHz | avg %5.0f MHz | peak %5.0f MHz" % (
-            L.get("cpu_avg_mhz", 0), P["cpu_freq_mhz"]["avg"], P["cpu_freq_mhz"]["max"]))
-        print("  GPU 3D/Render (Compositor & 3D engine) : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
-            L.get("gpu_render_pct", 0), P["gpu_render"]["avg"], P["gpu_render"]["p95"], P["gpu_render"]["max"]))
-        print("  GPU Video Decode (Hardware Acceleration): cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
-            L.get("gpu_video_pct", 0), P["gpu_video_decode"]["avg"], P["gpu_video_decode"]["p95"], P["gpu_video_decode"]["max"]))
-        print("  RAM Used (excl. reclaimable cache)     : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%% (min avail %.0f MiB)" % (
-            L.get("mem_used_pct", 0), P["ram_pct"]["avg"], P["ram_pct"]["p95"], P["ram_pct"]["max"], P["ram_avail_min_mib"]))
-        print("  Compressed Swap (zram / zswap)         : zram %.0f->%.0f MiB | zswap %.0f MiB" % (
-            L.get("zram_orig_mib", 0), L.get("zram_compr_mib", 0), L.get("zswap_mib", 0)))
-        print("  Disk Busy & Write Rate (Primary Drive) : busy avg %4.1f%% (peak %4.1f%%) | write avg %6.1f KiB/s (peak %6.1f KiB/s)" % (
-            P["nvme_busy_pct"]["avg"], P["nvme_busy_pct"]["max"], P["nvme_write_kibs"]["avg"], P["nvme_write_kibs"]["max"]))
-        print("  Package Power & Temperature       : %4.1f W (avg %4.1f W, peak %4.1f W) | %4.0f C (peak %4.0f C)" % (
-            L.get("pkg_watts", 0), P["pkg_watts"]["avg"], P["pkg_watts"]["max"], L.get("cpu_temp_c", 0), P["cpu_temp_c"]["max"]))
-        print("  Kernel PSI Stalls (CPU / Mem / IO) : CPU avg %.2f%% | Mem avg %.2f%% | IO avg %.2f%%" % (
-            P["psi_cpu_some"]["avg"], P["psi_mem_some"]["avg"], P["psi_io_some"]["avg"]))
-        print("-" * 78)
+        print(" Hardware coverage: %.1f%% | Activity source: %s" % (
+            data.get("hardware_coverage_pct", 0), data.get("activity_source", "unknown")))
+        if data.get("activity_warning"):
+            print(" Note: " + data["activity_warning"])
+        if data["sample_count"] == 0:
+            print(" No hardware samples in this window. Hardware values are unavailable.")
+        else:
+            print(" Power profile: %s (EPP=%s, AC=%s)  |  Battery health: %s%%" % (
+                L.get("power_profile", "?"), L.get("epp", "?"), L.get("ac_online", 0), P["battery_health_pct"]))
+            print("-" * 78)
+            print(" HARDWARE POTENTIAL UTILIZATION (System capacity & workload ceilings)")
+            print("  CPU Frequency-Weighted Busy (estimate): cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+                L.get("cpu_potential_pct", 0), P["cpu_true_potential"]["avg"], P["cpu_true_potential"]["p95"], P["cpu_true_potential"]["max"]))
+            print("  CPU Thread Busy (all active threads)   : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+                L.get("cpu_busy_pct", 0), P["cpu_busy"]["avg"], P["cpu_busy"]["p95"], P["cpu_busy"]["max"]))
+            print("  CPU Busiest Single Thread (1T max)     : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+                L.get("cpu_max_thread_pct", 0), P["cpu_single_thread"]["avg"], P["cpu_single_thread"]["p95"], P["cpu_single_thread"]["max"]))
+            print("  CPU Clocks (peak recorded / ceiling)   : cur %5.0f MHz | avg %5.0f MHz | peak %5.0f MHz" % (
+                L.get("cpu_avg_mhz", 0), P["cpu_freq_mhz"]["avg"], P["cpu_freq_mhz"]["max"]))
+            print("  GPU 3D/Render (Compositor & 3D engine) : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+                L.get("gpu_render_pct", 0), P["gpu_render"]["avg"], P["gpu_render"]["p95"], P["gpu_render"]["max"]))
+            print("  GPU Video Decode (Hardware Acceleration): cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+                L.get("gpu_video_pct", 0), P["gpu_video_decode"]["avg"], P["gpu_video_decode"]["p95"], P["gpu_video_decode"]["max"]))
+            print("  RAM Used (excl. reclaimable cache)     : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%% (min avail %.0f MiB)" % (
+                L.get("mem_used_pct", 0), P["ram_pct"]["avg"], P["ram_pct"]["p95"], P["ram_pct"]["max"], P["ram_avail_min_mib"]))
+            print("  Compressed Swap (zram / zswap)         : zram %.0f->%.0f MiB | zswap %.0f MiB" % (
+                L.get("zram_orig_mib", 0), L.get("zram_compr_mib", 0), L.get("zswap_mib", 0)))
+            print("  Disk Busy & Write Rate (Primary Drive) : busy avg %4.1f%% (peak %4.1f%%) | write avg %6.1f KiB/s (peak %6.1f KiB/s)" % (
+                P["nvme_busy_pct"]["avg"], P["nvme_busy_pct"]["max"], P["nvme_write_kibs"]["avg"], P["nvme_write_kibs"]["max"]))
+            print("  Package Power & Temperature       : %4.1f W (avg %4.1f W, peak %4.1f W) | %4.0f C (peak %4.0f C)" % (
+                L.get("pkg_watts", 0), P["pkg_watts"]["avg"], P["pkg_watts"]["max"], L.get("cpu_temp_c", 0), P["cpu_temp_c"]["max"]))
+            print("  Kernel PSI Stalls (CPU / Mem / IO) : CPU avg %.2f%% | Mem avg %.2f%% | IO avg %.2f%%" % (
+                P["psi_cpu_some"]["avg"], P["psi_mem_some"]["avg"], P["psi_io_some"]["avg"]))
+            print("-" * 78)
         print(" SCREEN TIME & WHOLE-SYSTEM LOAD WHILE APPLICATION IS FOCUSED")
         for a in data["apps"][:12]:
+            if not a.get("hardware_available", True):
+                print("  %-28s  %8s  | Hardware unavailable" % (a["app"][:28], fmt_dur(a["seconds"])))
+                continue
             print("  %-28s  %8s  | CPU %5.1f%% (pot %4.1f%%) | GPU %4.1f%% | %4.1f W" % (
                 a["app"][:28], fmt_dur(a["seconds"]), a["avg_cpu_pct"], a["avg_cpu_potential_pct"], a["avg_gpu_pct"], a["avg_watts"]))
         print("-" * 78)
@@ -1338,6 +1421,9 @@ let
         if not data["browser_tabs"]:
             print("  (No active browser focus recorded in window yet)")
         for t in data["browser_tabs"][:12]:
+            if not t.get("hardware_available", True):
+                print("  %-42s  %8s  | Hardware unavailable" % (t["site"][:42], fmt_dur(t["seconds"])))
+                continue
             print("  %-42s  %8s  | CPU %4.1f%% | GPU %4.1f%% | %4.1f W" % (
                 t["site"][:42], fmt_dur(t["seconds"]), t["avg_cpu_pct"], t["avg_gpu_pct"], t["avg_watts"]))
         print("-" * 78)

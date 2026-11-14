@@ -8,11 +8,15 @@ let
   scanArgs = [ nixcare "scan" ] ++ flakeArgs ++ [ "--output" "${stateDir}/scan-latest.json" ];
   updateArgs = [ nixcare "check-updates" ] ++ flakeArgs ++ [ "--output" "${stateDir}/check-latest.json" ];
   updatesEnabled = cfg.checkUpdates && cfg.flakePath != null;
+  # ExecStart is parsed by systemd, not a shell. Match NixOS's escaping so
+  # spaces, quotes, dollar signs and percent specifiers in user paths stay literal.
+  escapeExecArgs = lib.concatMapStringsSep " "
+    (arg: lib.replaceStrings [ "%" "$" ] [ "%%" "$$" ] (builtins.toJSON arg));
   mkService = description: args: {
     Unit.Description = description;
     Service = {
       Type = "oneshot";
-      ExecStart = lib.escapeShellArgs args;
+      ExecStart = escapeExecArgs args;
       Nice = 10;
       IOSchedulingClass = "idle";
       TimeoutStartSec = "10min";

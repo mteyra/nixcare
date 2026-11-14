@@ -2,7 +2,7 @@
 let
   flake = builtins.getFlake (toString ../.);
   lib = flake.inputs.nixpkgs.lib;
-  configuration = browserExtensions:
+  configuration = browserExtensions: extra:
     (lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
@@ -11,6 +11,7 @@ let
           system.stateVersion = "24.11";
           services.nixcare = {
             enable = true;
+            flakePath = "/etc/nixos/config's %n/\${HOME}";
             clean.enable = true;
             update.enable = true;
             track = {
@@ -20,10 +21,13 @@ let
             };
           };
         }
+        extra
       ];
     }).config;
-  enabled = configuration true;
-  disabled = configuration false;
+  enabled = configuration true {};
+  disabled = configuration false {};
+  fast = configuration false { services.nixcare.scan.vulnerabilities = false; };
+  unguarded = configuration false { services.nixcare.deferUnderLoad = false; };
   extension = "nglaklhklhcoonedhgnpgddginnjdadi;https://clients2.google.com/service/update2/crx";
   policies = path:
     builtins.fromJSON enabled.environment.etc.${path}.text;
@@ -44,12 +48,22 @@ assert builtins.elem extension (policies "opt/chrome/policies/managed/default.js
 assert builtins.elem extension (policies "chromium/policies/managed/default.json").ExtensionInstallForcelist;
 assert !(builtins.any (package: lib.getName package == "chromium") enabled.environment.systemPackages);
 assert builtins.all retriesOnlyDeferredWork maintenanceServices;
-assert !(enabled.systemd.services.nixcare-scan.serviceConfig ? RestartForceExitStatus);
+assert enabled.services.nixcare.deferUnderLoad;
+assert enabled.systemd.services.nixcare-scan.serviceConfig.RestartForceExitStatus == [ 75 ];
+assert !(enabled.systemd.services.nixcare-scan.unitConfig ? ConditionACPower);
 assert !(enabled.systemd.services.nixcare-check-updates.serviceConfig ? RestartForceExitStatus);
+assert lib.hasInfix "/etc/nixos/config's %%n/$$" enabled.systemd.services.nixcare-check-updates.serviceConfig.ExecStart;
+assert !(fast.systemd.services.nixcare-scan.serviceConfig ? RestartForceExitStatus);
+assert lib.hasSuffix "scan --fast" fast.systemd.services.nixcare-scan.serviceConfig.ExecStart;
+assert !(unguarded.systemd.services.nixcare-scan.serviceConfig ? RestartForceExitStatus);
+assert retriesOnlyDeferredWork unguarded.systemd.services.nixcare-update;
 {
   browserExtensionPoliciesWorkWhenEnabled = true;
   browserExtensionPoliciesStayOptIn = true;
   chromiumIsNotInstalledByPolicy = true;
   deferredMaintenanceRetriesWithoutSkippingTheRun = true;
-  ordinaryFailuresAndLightweightChecksDoNotRetry = true;
+  vulnerabilityScansCanWaitForResources = true;
+  ordinaryFailuresAndInputChecksDoNotRetry = true;
+  inputCheckKeepsSpecialCharactersInPathsLiteral = true;
+  fastScansAndResourceOptOutSkipLoadDeferrals = true;
 }

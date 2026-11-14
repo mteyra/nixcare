@@ -35,9 +35,9 @@ def duration_seconds(value):
 
 
 def is_browser_app(app_name):
-    if not app_name:
+    if not isinstance(app_name, str):
         return False
-    return app_name.lower() in ALL_BROWSER_APPS
+    return app_name.strip().lower() in ALL_BROWSER_APPS
 
 
 def parse_iso(ts):
@@ -80,10 +80,13 @@ def clip_events(events, t_start, t_end):
         s_c = max(s, t_start)
         e_c = min(e, t_end)
         if s_c < e_c:
-            clipped.append((s_c, e_c, data))
+            # Keep original chronology when multiple events began before the
+            # window. Sorting only clipped starts makes API response order
+            # decide whether an older active event overrides a newer AFK one.
+            clipped.append((s, s_c, e_c, data))
 
     clipped.sort(key=lambda x: x[0])
-    return clipped
+    return [(s_c, e_c, data) for _, s_c, e_c, data in clipped]
 
 
 def make_disjoint(events):
@@ -158,8 +161,9 @@ def intersect_intervals(ivs_a, ivs_b):
 
 def extract_site_domain(url, title=""):
     """Extract clean domain/site name from URL or title."""
-    if not url:
-        return title or "(browser)"
+    fallback = title if isinstance(title, str) and title else "(browser)"
+    if not isinstance(url, str) or not url:
+        return fallback
     try:
         parsed = urllib.parse.urlparse(url)
         netloc = parsed.hostname
@@ -169,7 +173,7 @@ def extract_site_domain(url, title=""):
             return parsed.scheme + ":" + (parsed.path or "")
     except Exception:
         pass
-    return title or "(browser)"
+    return fallback
 
 
 def compute_screen_time_summary(
@@ -199,10 +203,16 @@ def compute_screen_time_summary(
     - browser_tabs: list of {"site": str, "browser": str, "seconds": float, "audible_seconds": float}
     - invariants_passed: bool
     """
-    window_duration = max(0.0, float(window_end - window_start))
+    window_start, window_end = float(window_start), float(window_end)
+    if not math.isfinite(window_start) or not math.isfinite(window_end) or window_end < window_start:
+        raise ValueError("Activity window must have finite, ordered boundaries")
+    window_duration = window_end - window_start
 
     # 1. Clip and merge AFK events
     clipped_afk = make_disjoint(clip_events(afk_events, window_start, window_end))
+    active_measurement_available = any(
+        d.get("status") in ("afk", "not-afk") for _, _, d in clipped_afk
+    )
 
     # Tracked time: union of all AFK events (afk + not-afk)
     tracked_ivs = merge_intervals([(s, e, d) for s, e, d in clipped_afk])
@@ -219,17 +229,17 @@ def compute_screen_time_summary(
         sum(e - s for s, e in active_ivs),
     )
 
-    # If no AFK bucket exists or returned 0 events, but window events exist,
-    # fallback active time to window duration / events.
-    if not clipped_afk and window_events:
+    # An open window proves coverage, not that its user was present. Let the
+    # caller fall back to sampled AFK evidence instead of inventing active time.
+    if not active_measurement_available and window_events:
         clipped_win_fallback = clip_events(window_events, window_start, window_end)
         disjoint_win_fallback = make_disjoint(clipped_win_fallback)
         total_tracked_seconds = min(
             window_duration,
             sum(e - s for s, e, _ in disjoint_win_fallback),
         )
-        active_screen_seconds = total_tracked_seconds
-        active_ivs = [(s, e) for s, e, _ in disjoint_win_fallback]
+        active_screen_seconds = 0.0
+        active_ivs = []
 
     # 2. Window events clipped and made disjoint
     clipped_window = clip_events(window_events, window_start, window_end)
@@ -262,7 +272,7 @@ def compute_screen_time_summary(
         b_active_ivs = [
             (s, e, da)
             for s, e, da, _ in active_window_ivs
-            if (da.get("app") or "").lower() in b_apps
+            if isinstance(da.get("app"), str) and da["app"].strip().lower() in b_apps
         ]
         b_focus_sec = sum(e - s for s, e, _ in b_active_ivs)
         browser_focus[b_key] = b_focus_sec
@@ -287,7 +297,7 @@ def compute_screen_time_summary(
             for s, e, dw, _ in site_active:
                 dur = e - s
                 url = dw.get("url") or ""
-                title = dw.get("title") or ""
+                title = dw.get("title") if isinstance(dw.get("title"), str) else ""
                 site = extract_site_domain(url, title)
 
                 site_dur[site] = site_dur.get(site, 0.0) + dur
@@ -318,11 +328,12 @@ def compute_screen_time_summary(
     })
 
     return {
-        "window_seconds": round(window_duration, 1),
-        "total_tracked_seconds": round(total_tracked_seconds, 1),
-        "active_screen_seconds": round(active_screen_seconds, 1),
+        "window_seconds": window_duration,
+        "total_tracked_seconds": duration_seconds(total_tracked_seconds),
+        "active_screen_seconds": duration_seconds(active_screen_seconds),
+        "active_measurement_available": active_measurement_available,
         "apps": apps_list,
-        "browser_focus": {k: round(v, 1) for k, v in browser_focus.items()},
+        "browser_focus": {k: duration_seconds(v) for k, v in browser_focus.items()},
         "browser_tabs": browser_tabs_list,
         "invariants_passed": invariants_passed,
     }
@@ -341,6 +352,19 @@ def verify_invariants(summary, tolerance=0.15):
     apps = summary["apps"]
     browser_focus = summary.get("browser_focus", {})
     browser_tabs = summary.get("browser_tabs", [])
+    durations = (
+        [window, tracked, active]
+        + [a["seconds"] for a in apps]
+        + list(browser_focus.values())
+        + [t["seconds"] for t in browser_tabs]
+        + [t.get("audible_seconds", 0) for t in browser_tabs]
+    )
+    if any(not math.isfinite(value) or value < 0 for value in durations):
+        return False
+    if any(t.get("audible_seconds", 0) > t["seconds"] + tolerance for t in browser_tabs):
+        return False
+    if any(t.get("browser") not in browser_focus for t in browser_tabs):
+        return False
 
     # Invariant 1: tracked <= window
     if tracked > window + tolerance:

@@ -13,6 +13,7 @@ All options below live under `services.nixcare`. Import `nixcare.nixosModules.de
 | `flakePath` | `"/etc/nixos"` | Absolute local system flake directory |
 | `hostName` | `config.networking.hostName` | Configuration key under `nixosConfigurations` |
 | `onACPower` | `true` | Wait for AC power before starting scheduled cleanup, optimisation, and full builds |
+| `deferUnderLoad` | `true` | Wait for memory/CPU/I/O resources before heavy scheduled jobs and vulnerability scans |
 | `scan.enable` | `true` | Enable the system scan timer |
 | `scan.dates` | `"daily"` | Scan calendar schedule |
 | `scan.vulnerabilities` | `true` | Run vulnix; matches are advisory, failures are reported |
@@ -69,7 +70,9 @@ Nixcare's garbage collection removes unreferenced store paths globally, not just
 
 Cleanup, store optimisation, and full candidate builds keep their weekly schedules unless you change their `dates` options. They run with low CPU/I/O priority and check for AC power before starting when `onACPower = true`.
 
-If a scheduled job finds battery power or another Nixcare maintenance operation already running, it returns temporary exit status `75`. Its systemd service retries every **15 minutes**, letting the run proceed after you plug in or the earlier operation finishes. This retry applies only to those two conditions. Ordinary errors remain visible and are not automatically retried.
+With `deferUnderLoad = true`, heavy scheduled jobs and vulnerability scans also wait while any of these is true: available memory is below **15%** of total, the one-minute load average reaches the number of logical CPUs, or full memory/I/O pressure averages at least **2%/10%** over 60 seconds. Pressure accounting is optional on kernels without PSI. Fast scans and input discovery remain lightweight checks. These are checks before starting, not a guarantee of spare resources throughout a build. Nix daemon builds may consume resources outside the scheduling service's priority controls.
+
+Battery power, resource contention, or another Nixcare maintenance operation returns temporary exit status `75`. Its systemd service retries every **15 minutes**. Ordinary errors, including unreadable resource probes, remain visible and are not automatically retried. Direct CLI commands run immediately; disabling `deferUnderLoad` also bypasses the resource check for scheduled jobs.
 
 Deferred attempts leave the previous saved report unchanged. Check the current service and its journal to see whether work is running or waiting:
 
@@ -85,6 +88,12 @@ sudo systemctl stop nixcare-update.service
 ```
 
 Use `nixcare-clean.service` or `nixcare-optimise.service` for those jobs. Stopping the service cancels the pending retry; its timer can still start a run at the next scheduled time. To disable future runs, change that routine's `enable` option and rebuild. Stopping an actively running service interrupts its work, so check its status first.
+
+### Keeping a busy desktop session undisturbed
+
+`nixos-rebuild switch` activates a system configuration and may restart changed services. It does not request a reboot, but it is not a promise that a desktop session will be unaffected. Save work and choose a suitable time for activation. `nixos-rebuild boot` prepares the configuration for the next boot without switching the running system or rebooting it.
+
+Health scans and input checks do not activate configurations. Cleanup removes old generations and globally unreferenced store paths; store optimisation deduplicates files. Neither requests a logout or reboot, but both perform disk work. Leave maintenance until later when preserving a busy session is the priority.
 
 ## Home Manager
 
@@ -157,7 +166,7 @@ sudo nixcare rollback
 
 `--dry-run` takes precedence over `--apply` for cleanup and optimisation. `clean --skip-optimise` skips the additional cleanup-time deduplication if you enabled it. The NixOS scan has a different system-report schema from the portable doctor. `scan --fast` skips vulnix; it still collects other available system diagnostics.
 
-The NixOS scan returns `partial` and exit `1` if an enabled or required collector fails; `collection_errors` names the gaps, and unavailable counts are `null`. A complete scan with health findings returns `attention` and exit `0`, so findings and failed collection remain distinct. Interrupted cleanup, optimisation, and update checks record `interrupted` and exit `130`.
+The NixOS scan returns `partial` and exit `1` if an enabled or required collector fails; `collection_errors` names the gaps, and unavailable counts are `null`. Cache inventory has a shared 10,000-entry/250 ms traversal budget; incomplete sizes are lower bounds and explicitly marked. A complete scan with health findings returns `attention` and exit `0`, so findings and failed collection remain distinct. Interrupted cleanup, optimisation, and update checks record `interrupted` and exit `130`.
 
 `nixcare status` reads saved results under `/var/lib/nixcare/`. It does not start a new scan. The `nixcare` group grants read access to these system reports, which may include service names, listening sockets, and journal excerpts. Add only users who should see that information.
 
@@ -167,7 +176,7 @@ The NixOS scan returns `partial` and exit `1` if an enabled or required collecto
 
 `sudo nixcare update` copies the configuration into `/var/cache/nixcare/worktree`, updates that snapshot's inputs, and builds the selected NixOS system. It saves a package diff and a GC root for the candidate. Source configuration changes during the copy/build cause the candidate to be rejected.
 
-`sudo nixcare apply-update` checks the recorded configuration digest, candidate lock digest, host, and built store path. It copies the verified lock into the live configuration and activates the exact candidate. If activation fails, it attempts to restore the previous lock and system profile and records any recovery failure. There is no guarantee of automatic recovery from every application or hardware failure.
+`sudo nixcare apply-update` checks the recorded configuration digest, candidate lock digest, host, and built store path. It copies the verified lock into the live configuration and activates the exact candidate. If activation fails, it attempts to restore the previous lock, next-boot profile, and running system separately, and records any recovery failure. A lock edited concurrently during activation is preserved and reported for review. There is no guarantee of automatic recovery from every application or hardware failure.
 
 The latest pre-activation lock backup is `/var/lib/nixcare/flake.lock.before-update`. An activation can require a reboot to use a new kernel. After activation, run `nixcare doctor` and check your applications.
 
@@ -195,10 +204,15 @@ For hardware-only sampling, leave both activity options `false`. Activity integr
 
 ```sh
 nixcare report --hours 1
+nixcare report --hours 0.5    # Last 30 minutes
 nixcare report --json
 ```
 
 The dashboard is at <http://127.0.0.1:5601>. The ActivityWatch UI, when enabled, is at <http://127.0.0.1:5600>. The Nixcare API validates loopback Host/Origin headers, escapes displayed activity text, limits query windows to configured retention, and caches repeated summaries briefly.
+
+`--hours` accepts a finite positive number up to the configured retention period. Reports keep the exact requested boundary, exclude future samples, and distinguish hardware coverage from activity coverage. Missing history does not mean zero use. Active time requires idle/active evidence; an open window alone is insufficient. Application and site totals are clipped to active focus intervals, so background tabs do not accumulate focused browsing time.
+
+ActivityWatch queries prefer this machine's buckets. Ambiguous, unavailable, or oversized history falls back to sampled activity with a visible warning and `activity_source`. Each history response is limited to 4 MiB and 20,000 events; database reads have a time budget. Request fewer hours when a detailed window is too large. A fallback is less precise than complete ActivityWatch intervals, particularly around focus changes.
 
 The Nixcare database is at `/var/lib/laptop-telemetry/telemetry.db`, with root-owned `0700` directory and `0600` files. **Loopback HTTP reports are accessible to other local OS users.** ActivityWatch has its own data storage and retention; `track.retentionDays` applies to Nixcare's SQLite samples, not to ActivityWatch's independent history. Disabling tracking stops collection but preserves existing data.
 
@@ -214,7 +228,7 @@ CPU capacity is a frequency-weighted busy estimate, not a benchmark. Application
 | Old lock input but no available update | It may be intentionally revision-pinned, or upstream may not have changed |
 | No saved report yet | Check timers or start the service once; installing the portable CLI alone creates no schedule |
 | `Permission denied` reading system reports | Start a new login session after joining `nixcare`; use `sudo nixcare status` meanwhile |
-| Heavy job is waiting or exits `75` | Check power and other running maintenance jobs; scheduled jobs retry these conditions every 15 minutes |
+| Heavy job is waiting or exits `75` | Check its journal for power, memory/CPU/I/O pressure, or another maintenance job; deferred jobs retry every 15 minutes |
 | Candidate became stale | Finish configuration edits and run `sudo nixcare update` again |
 | A snapshot build cannot resolve `../shared` | Use the full-build layout guidance above; portable `check-updates` preserves Git subdirectory context |
 | Optional report unavailable | Enable `track.enable` and inspect `laptop-telemetry.service` |

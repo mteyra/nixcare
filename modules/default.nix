@@ -3,6 +3,8 @@
 let
   cfg = config.services.nixcare;
   portable = pkgs.callPackage ../package.nix { };
+  escapeExecArgs = lib.concatMapStringsSep " "
+    (arg: lib.replaceStrings [ "%" "$" ] [ "%%" "$$" ] (builtins.toJSON arg));
   settings = pkgs.writeText "nixcare-settings.json" (builtins.toJSON {
     flake_path = cfg.flakePath;
     host_name = cfg.hostName;
@@ -47,9 +49,18 @@ let
     Group = "nixcare";
     UMask = "0027";
   };
+  resourceGuard = lib.optionalString cfg.deferUnderLoad ''
+    ${pkgs.python3}/bin/python3 ${./schedule_guard.py}
+  '';
+  scheduledScan = pkgs.writeShellApplication {
+    name = "nixcare-scheduled-scan";
+    text = resourceGuard + ''
+      exec ${nixcareBin}/bin/nixcare scan
+    '';
+  };
   scheduledMaintenance = pkgs.writeShellApplication {
     name = "nixcare-scheduled";
-    text = lib.optionalString cfg.onACPower ''
+    text = resourceGuard + lib.optionalString cfg.onACPower ''
       # A unit condition would skip this week's run entirely while on battery.
       # Exit 75 before starting work so systemd can retry the pending run.
       # Probe errors also exit 1, so only the explicit "no" result means battery.
@@ -72,7 +83,7 @@ let
     '';
   };
   retryDeferred = {
-    # Busy maintenance locks and battery deferrals happen before any work.
+    # Resource pressure, busy locks and battery deferrals precede any work.
     # Other failures need attention, and must not restart a partial operation.
     Restart = "no";
     RestartForceExitStatus = [ 75 ];
@@ -118,6 +129,11 @@ in
       type = lib.types.bool;
       default = true;
       description = "Run scheduled cleanup, optimisation and full update builds only on AC power. Lightweight checks still run on battery.";
+    };
+    deferUnderLoad = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Defer scheduled heavy maintenance and vulnerability scans when available memory is below 15%, load reaches the logical CPU count, or sustained memory/I/O stalls indicate contention. Checks before starting; does not pause an already running operation.";
     };
     scan = {
       enable = lib.mkOption { type = lib.types.bool; default = true; description = "Run read-only health scans."; };
@@ -208,8 +224,11 @@ in
     };
     systemd.services.nixcare-scan = lib.mkIf cfg.scan.enable {
       description = "nixcare: read-only health scan";
-      serviceConfig = stateService // lowPriority // {
-        ExecStart = "${nixcareBin}/bin/nixcare scan${lib.optionalString (!cfg.scan.vulnerabilities) " --fast"}";
+      serviceConfig = stateService // lowPriority
+        // lib.optionalAttrs (cfg.scan.vulnerabilities && cfg.deferUnderLoad) retryDeferred // {
+        ExecStart = if cfg.scan.vulnerabilities
+          then lib.getExe scheduledScan
+          else "${nixcareBin}/bin/nixcare scan --fast";
         TimeoutStartSec = "15min";
       };
     };
@@ -221,7 +240,10 @@ in
         ExecStopPost = "${pkgs.bash}/bin/bash -c 'test ! -f /var/lib/nixcare/check-updates-latest.json || ${pkgs.coreutils}/bin/chmod 0640 /var/lib/nixcare/check-updates-latest.json'";
         CacheDirectory = "nixcare";
         CacheDirectoryMode = "0750";
-        ExecStart = "${portable}/bin/nixcare check-updates --flake ${lib.escapeShellArg cfg.flakePath} --output /var/lib/nixcare/check-updates-latest.json";
+        ExecStart = escapeExecArgs [
+          "${portable}/bin/nixcare" "check-updates" "--flake" cfg.flakePath
+          "--output" "/var/lib/nixcare/check-updates-latest.json"
+        ];
         ExecStartPost = "${pkgs.coreutils}/bin/chmod 0640 /var/lib/nixcare/check-updates-latest.json";
         TimeoutStartSec = "20min";
       };

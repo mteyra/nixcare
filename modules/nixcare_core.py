@@ -7,8 +7,11 @@ import hashlib
 import pwd
 import tempfile
 import json
+import math
 import os
 import shutil
+import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -57,23 +60,73 @@ SECURITY_PKGS = (
     "curl",
 )
 
-def run_cmd(cmd, timeout=60, env=None, cwd=None):
+COMMAND_OUTPUT_LIMIT = 1024 * 1024
+OUTPUT_TRUNCATED = "[nixcare: earlier output truncated]\n"
+
+
+def collect_output(process, timeout, limit=COMMAND_OUTPUT_LIMIT):
+    """Drain both pipes without retaining arbitrarily large build/journal logs."""
+    deadline = time.monotonic() + timeout
+    outputs = {process.stdout: bytearray(), process.stderr: bytearray()}
+    truncated = {stream: False for stream in outputs}
+    with selectors.DefaultSelector() as selector:
+        for stream in outputs:
+            selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output = outputs[key.fileobj]
+                output.extend(chunk)
+                if len(output) > limit:
+                    del output[:-limit]
+                    truncated[key.fileobj] = True
+    process.wait(timeout=max(0.001, deadline - time.monotonic()))
+    return tuple((OUTPUT_TRUNCATED if truncated[stream] else "") +
+                 outputs[stream].decode("utf-8", errors="replace").strip()
+                 for stream in (process.stdout, process.stderr))
+
+
+def stop_command(process):
+    # Each command has its own session. Never signal the caller's terminal,
+    # another user's build, or the shared Nix daemon.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def run_cmd(cmd, timeout=60, env=None, cwd=None, complete_output=True):
     # Commands work even when the user's global Nix configuration disables the
     # experimental CLI; enabling features for this invocation has no side effect.
     if cmd and os.path.basename(cmd[0]) == "nix":
         cmd = [cmd[0], "--extra-experimental-features", "nix-command flakes"] + list(cmd[1:])
     try:
-        r = subprocess.run(
+        with subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
             env=env,
             cwd=cwd,
-        )
-        return r.returncode, r.stdout.strip(), r.stderr.strip()
-    except Exception as e:
-        return 1, "", str(e)
+        ) as process:
+            try:
+                out, error = collect_output(process, timeout)
+            except BaseException:
+                stop_command(process)
+                raise
+            if complete_output and out.startswith(OUTPUT_TRUNCATED):
+                return 1, out, "Command output exceeded the capture limit; a complete result is unavailable."
+            return process.returncode, out, error
+    except (OSError, subprocess.SubprocessError) as error:
+        return 1, "", str(error)
 
 def notify_user(title, body, urgency="normal"):
     try:
@@ -137,7 +190,7 @@ def maintenance_lock():
 
 
 def checked_cmd(command, timeout=60, **kwargs):
-    rc, out, error = run_cmd(command, timeout=timeout, **kwargs)
+    rc, out, error = run_cmd(command, timeout=timeout, complete_output=False, **kwargs)
     if rc:
         raise RuntimeError("%s failed (exit %s): %s" % (command[0], rc, error or out))
     return out
@@ -172,6 +225,7 @@ def source_digest(path):
             else:
                 digest.update(b"missing")
         elif os.path.isfile(full):
+            digest.update(str(stat.S_IMODE(os.stat(full).st_mode)).encode() + b":")
             digest.update(b"file:" + digest_file(full).encode())
         elif os.path.isdir(full):
             digest.update(b"directory:")
@@ -190,24 +244,80 @@ def source_digest(path):
 def snapshot_ignore(directory, names):
     return [name for name in names if name == ".git" or name == "result" or name.startswith("result-")]
 
-def dir_size_and_mtime(path):
+def dir_size_and_mtime(path, budget):
+    """Inventory without following links or traversing an unlimited cache tree."""
     total = 0
     latest_mtime = 0.0
+    complete = True
+    iterators = []
     try:
-        for root, dirs, files in os.walk(path):
-            for f in files:
-                fp = os.path.join(root, f)
+        iterators.append(os.scandir(path))
+        while iterators:
+            if budget["remaining"] <= 0 or time.monotonic() >= budget["deadline"]:
+                budget["exhausted"] = True
+                complete = False
+                break
+            try:
+                entry = next(iterators[-1])
+            except StopIteration:
+                iterators.pop().close()
+                continue
+            budget["remaining"] -= 1
+            try:
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    iterators.append(os.scandir(entry.path))
+                elif stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+                    latest_mtime = max(latest_mtime, info.st_mtime)
+            except OSError:
+                complete = False
+    except OSError:
+        complete = False
+    finally:
+        for iterator in iterators:
+            iterator.close()
+    return total, latest_mtime, complete
+
+
+def scan_caches(root, now, max_entries=10000, max_seconds=0.25):
+    budget = {"remaining": max_entries, "deadline": time.monotonic() + max_seconds,
+              "exhausted": False}
+    caches = []
+    complete = True
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if budget["remaining"] <= 0 or time.monotonic() >= budget["deadline"]:
+                    complete = False
+                    break
+                budget["remaining"] -= 1
                 try:
-                    st = os.lstat(fp)
-                    if not stat.S_ISLNK(st.st_mode):
-                        total += st.st_size
-                    if st.st_mtime > latest_mtime:
-                        latest_mtime = st.st_mtime
-                except Exception:
-                    pass
-    except Exception:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    complete = False
+                    continue
+                size, mtime, finished = dir_size_and_mtime(entry.path, budget)
+                complete = complete and finished
+                mib = round(size / 1048576.0, 1)
+                if mib >= 10.0 or not finished:
+                    caches.append({
+                        "name": entry.name, "size_mib": mib,
+                        "unmodified_days": round((now - mtime) / 86400.0, 1) if mtime > 0 else 0.0,
+                        "inventory_complete": finished,
+                        "policy": "regenerable" if entry.name in REGENERABLE_CACHES else "review",
+                    })
+                if budget["exhausted"]:
+                    break
+    except FileNotFoundError:
         pass
-    return total, latest_mtime
+    except OSError:
+        complete = False
+    caches.sort(key=lambda cache: cache["size_mib"], reverse=True)
+    return caches, complete
 
 def cmd_scan(args):
     now = time.time()
@@ -298,24 +408,9 @@ def cmd_scan(args):
     root_free_gib = round((st_vfs.f_bavail * st_vfs.f_frsize) / (1024**3), 2)
 
     cache_root = os.path.expanduser("~" + OWNER_USER + "/.cache")
-    caches = []
-    if os.path.isdir(cache_root):
-        for entry in sorted(os.listdir(cache_root)):
-            ep = os.path.join(cache_root, entry)
-            if not os.path.isdir(ep) or os.path.islink(ep):
-                continue
-            sz, mtime = dir_size_and_mtime(ep)
-            mib = round(sz / 1048576.0, 1)
-            if mib < 10.0:
-                continue
-            age_d = round((now - mtime) / 86400.0, 1) if mtime > 0 else 0.0
-            caches.append({
-                "name": entry,
-                "size_mib": mib,
-                "unmodified_days": age_d,
-                "policy": "regenerable" if entry in REGENERABLE_CACHES else "review",
-            })
-    caches.sort(key=lambda x: x["size_mib"], reverse=True)
+    caches, caches_complete = scan_caches(cache_root, now)
+    if not caches_complete:
+        collection_errors["cache_inventory"] = "Cache inventory stopped at its work budget or an unreadable entry; partial sizes are lower bounds."
 
     report["disk"] = {
         "root_total_gib": root_total_gib,
@@ -324,6 +419,7 @@ def cmd_scan(args):
         "oldest_generation": gens[0] if gens else None,
         "newest_generation": gens[-1] if gens else None,
         "caches_over_10mib": caches,
+        "cache_inventory_complete": caches_complete,
     }
 
     # 3. Hardware (from tracker API + sysfs)
@@ -541,6 +637,11 @@ def cmd_clean(args):
         atomic_json(state_file("clean"), report)
         try:
             if to_delete:
+                # Another administrator can switch the system outside our lock
+                # while cache inspection runs. Never broaden the original plan.
+                _, still_deletable = generation_plan()
+                to_delete = [number for number in to_delete if number in still_deletable]
+            if to_delete:
                 checked_cmd(["nix-env", "--profile", PROFILE, "--delete-generations"] + to_delete, timeout=300)
                 report["generations_removed"] = to_delete
                 # Refresh boot entries before GC so no menu entry points at deleted store paths.
@@ -592,8 +693,18 @@ def cmd_optimise(args):
             atomic_json(state_file("optimise"), report)
     return 0
 
+def validate_update_layout():
+    source = os.path.realpath(FLAKE_PATH)
+    for destination in (WORKTREE_DIR, STATE_DIR):
+        target = os.path.realpath(destination)
+        if os.path.commonpath([source, target]) in (source, target):
+            raise RuntimeError("System flake and nixcare state/worktree directories must not overlap: " +
+                               FLAKE_PATH + " and " + destination)
+
+
 def cmd_update(args):
     require_root()
+    validate_update_layout()
     print("nixcare update — building an isolated candidate; your running system stays active")
     with maintenance_lock():
         report = {"schema_version": 1, "timestamp": int(time.time()), "status": "checking",
@@ -611,14 +722,25 @@ def cmd_update(args):
             if not isinstance(lock_data, dict) or not isinstance(lock_data.get("nodes"), dict):
                 raise ValueError("flake.lock must contain a nodes object")
             nodes = lock_data["nodes"]
-            direct_inputs = nodes.get(lock_data.get("root", "root"), {}).get("inputs", {})
+            root_name = lock_data.get("root", "root")
+            if not isinstance(root_name, str):
+                raise ValueError("flake.lock root must name a node")
+            root_node = nodes.get(root_name, {})
+            if not isinstance(root_node, dict):
+                raise ValueError("flake.lock root node must be an object")
+            direct_inputs = root_node.get("inputs", {})
             if not isinstance(direct_inputs, dict):
                 raise ValueError("flake.lock root inputs must be an object")
             for name, node_id in direct_inputs.items():
                 if not isinstance(node_id, str):
                     continue
-                original = nodes.get(node_id, {}).get("original", {})
+                node = nodes.get(node_id)
+                if not isinstance(node, dict) or not isinstance(node.get("original", {}), dict):
+                    raise ValueError("flake.lock input %s has no valid node/original object" % name)
+                original = node.get("original", {})
                 relative = original.get("path", "")
+                if not isinstance(relative, str):
+                    raise ValueError("flake.lock input %s has an invalid path" % name)
                 if original.get("type") != "path" or not relative or os.path.isabs(relative):
                     continue
                 source_root = os.path.abspath(FLAKE_PATH)
@@ -687,6 +809,8 @@ def read_candidate():
             report = json.load(stream)
     except (OSError, ValueError) as error:
         raise RuntimeError("No verified candidate is available. Run sudo nixcare update first.") from error
+    if not isinstance(report, dict):
+        raise RuntimeError("Saved candidate report is invalid. Run sudo nixcare update first.")
     if report.get("status") != "ready" or report.get("build_verified") is not True:
         raise RuntimeError("Latest update did not produce an unused verified candidate. Run sudo nixcare update.")
     if report.get("flake") != FLAKE_PATH or report.get("host") != HOST_NAME:
@@ -697,7 +821,7 @@ def read_candidate():
     if not os.path.isfile(lock) or digest_file(lock) != report.get("candidate_lock_digest"):
         raise RuntimeError("Candidate lock changed or is missing. Run sudo nixcare update again.")
     candidate = report.get("candidate", "")
-    if (not candidate.startswith("/nix/store/") or
+    if (not isinstance(candidate, str) or not candidate.startswith("/nix/store/") or
             candidate != os.path.realpath(os.path.join(STATE_DIR, "next-system")) or
             not os.path.isfile(os.path.join(candidate, "bin/switch-to-configuration"))):
         raise RuntimeError("Prebuilt candidate is missing or changed. Run sudo nixcare update again.")
@@ -712,11 +836,17 @@ def cmd_apply_update(args):
         backup = os.path.join(STATE_DIR, "flake.lock.before-update")
         shutil.copy2(destination, backup)
         previous = os.path.realpath(PROFILE)
+        previous_running = os.path.realpath(CURRENT_SYSTEM) if os.path.exists(CURRENT_SYSTEM) else previous
         report["status"] = "applying"
+        report["activation_started_at"] = int(time.time())
         atomic_json(state_file("update"), report)
         switched_profile = False
+        installed_lock = False
         try:
+            if report.get("source_digest") != source_digest(FLAKE_PATH):
+                raise RuntimeError("Configuration changed before activation. Run sudo nixcare update again.")
             copy_lock_atomic(lock, destination)
+            installed_lock = True
             checked_cmd(["nix-env", "--profile", PROFILE, "--set", candidate], timeout=300)
             switched_profile = True
             # Activate the exact closure tested above, never an untested rebuild.
@@ -725,13 +855,26 @@ def cmd_apply_update(args):
         except (RuntimeError, OSError, KeyboardInterrupt) as error:
             report.update(status="apply-failed", error=str(error) or "Activation interrupted")
             recovery_errors = []
-            try:
-                copy_lock_atomic(backup, destination)
-            except OSError as recovery_error:
-                recovery_errors.append("lock restore: " + str(recovery_error))
+            if installed_lock:
+                try:
+                    if digest_file(destination) != report.get("candidate_lock_digest"):
+                        recovery_errors.append("flake.lock changed during activation; preserved the newer file instead of overwriting it.")
+                    else:
+                        copy_lock_atomic(backup, destination)
+                except OSError as recovery_error:
+                    recovery_errors.append("lock restore: " + str(recovery_error))
             if switched_profile or os.path.realpath(PROFILE) != previous:
-                for command in (["nix-env", "--profile", PROFILE, "--set", previous],
-                                [os.path.join(previous, "bin/switch-to-configuration"), "switch"]):
+                recovery_commands = [["nix-env", "--profile", PROFILE, "--set", previous]]
+                if previous_running == previous:
+                    recovery_commands.append([os.path.join(previous, "bin/switch-to-configuration"), "switch"])
+                else:
+                    # A prior `nixos-rebuild boot` can make the next-boot profile
+                    # differ from the running system. Restore both separately.
+                    recovery_commands.extend([
+                        [os.path.join(previous, "bin/switch-to-configuration"), "boot"],
+                        [os.path.join(previous_running, "bin/switch-to-configuration"), "test"],
+                    ])
+                for command in recovery_commands:
                     try:
                         checked_cmd(command, timeout=600)
                     except RuntimeError as recovery_error:
@@ -741,6 +884,7 @@ def cmd_apply_update(args):
                 print("Automatic recovery needs attention: " + "; ".join(recovery_errors), file=sys.stderr)
             raise
         finally:
+            report["completed_at"] = int(time.time())
             atomic_json(state_file("update"), report)
     print("Verified update activated. Previous generations remain available for rollback.")
     return 0
@@ -760,6 +904,8 @@ def cmd_status(args):
         try:
             with open(state_file(name), encoding="utf-8") as stream:
                 reports[name] = json.load(stream)
+            if not isinstance(reports[name], dict):
+                raise ValueError("Saved report must be a JSON object")
         except FileNotFoundError:
             reports[name] = {"status": "not-run"}
         except (OSError, ValueError) as error:
@@ -770,7 +916,10 @@ def cmd_status(args):
         print("nixcare — latest maintenance results")
         for name, report in reports.items():
             when = report.get("completed_at", report.get("timestamp", report.get("checked_at")))
-            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(when)) if isinstance(when, (int, float)) else str(when or "")
+            try:
+                stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(when)) if isinstance(when, (int, float)) else str(when or "")
+            except (OverflowError, OSError, ValueError):
+                stamp = "invalid saved timestamp"
             print("  %-14s %-14s %s" % (name, report.get("status", "recorded"), stamp))
             if report.get("error"):
                 print("    " + str(report["error"])[-1000:])
@@ -810,8 +959,8 @@ def main(argv=None):
         if args.cmd == "report":
             if not TRACK_ENABLED:
                 raise RuntimeError("Telemetry is disabled. Set services.nixcare.track.enable = true to opt in.")
-            if args.hours <= 0:
-                ap.error("--hours must be positive")
+            if not math.isfinite(args.hours) or args.hours <= 0:
+                ap.error("--hours must be finite and positive")
             command = ["laptop-report", "--hours", str(args.hours)]
             if args.json:
                 command.append("--json")

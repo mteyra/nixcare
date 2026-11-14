@@ -1,6 +1,9 @@
 """Regression tests for telemetry's browser boundary and interval accounting."""
 
 import http.client
+import builtins
+import contextlib
+import io
 import json
 from pathlib import Path
 import re
@@ -11,11 +14,12 @@ import textwrap
 import threading
 import time
 import unittest
+from unittest import mock
 
 MODULES = Path(__file__).resolve().parents[1] / "modules"
 sys.path.insert(0, str(MODULES))
 import activity_intersector as ai
-from tracking_support import SummaryCache, local_request_allowed, validate_hours
+from tracking_support import SummaryCache, local_request_allowed, validate_hours, read_json_bounded, sample_duration, select_activity_buckets
 
 
 def collector_namespace():
@@ -29,6 +33,16 @@ def collector_namespace():
     namespace = {"__name__": "telemetry_test"}
     exec(compile(source, "track.nix:collector", "exec"), namespace)
     namespace["RETENTION_DAYS"] = 90
+    return namespace
+
+
+def report_namespace():
+    source = (MODULES / "track.nix").read_text().split('laptopReportBin = pkgs.writeScriptBin "laptop-report" \'\'\n', 1)[1]
+    source = textwrap.dedent(source.split("\n  '';", 1)[0])
+    source = source.replace("${toString cfg.track.retentionDays}", "90")
+    source = re.sub(r"\$\{[^}]+\}", "0", source)
+    namespace = {"__name__": "report_test"}
+    exec(compile(source, "track.nix:report", "exec"), namespace)
     return namespace
 
 
@@ -68,6 +82,50 @@ class TrackingBoundaryTests(unittest.TestCase):
         for hours in range(30):
             cache.get(hours, compute)
         self.assertLessEqual(len(cache.entries), 8)
+
+    def test_slow_summary_does_not_get_an_extra_freshness_window(self):
+        clock = [0]
+        cache = SummaryCache(ttl=15, clock=lambda: clock[0])
+        calls = []
+        def compute():
+            calls.append(True)
+            clock[0] += 20
+            return len(calls)
+        self.assertEqual(cache.get(24, compute), 1)
+        self.assertEqual(cache.get(24, compute), 2)
+
+    def test_activity_response_memory_limit_is_enforced(self):
+        self.assertEqual(read_json_bounded(io.BytesIO(b'{"ok":true}')), {"ok": True})
+        with self.assertRaisesRegex(ValueError, "response limit"):
+            read_json_bounded(io.BytesIO(b"x" * 17), max_bytes=16)
+
+    def test_suspend_or_clock_jump_is_not_a_short_burst_of_work(self):
+        self.assertEqual(sample_duration(5.25), 5.25)
+        for elapsed in (-1, 0, 16, 3600, float("inf"), float("nan")):
+            self.assertIsNone(sample_duration(elapsed))
+
+    def test_buckets_prefer_current_host_without_merging_legacy_or_imported_data(self):
+        buckets = {
+            "aw-watcher-afk_other": {"hostname": "other"},
+            "aw-watcher-afk_here": {"hostname": "here"},
+            "aw-watcher-window_here": {},
+            "aw-watcher-web-firefox": {"hostname": "unknown"},
+            "aw-watcher-web-firefox_here": {"hostname": "here"},
+            "aw-watcher-web-chrome_other": {"hostname": "other"},
+        }
+        self.assertEqual(select_activity_buckets(buckets, "HERE"), {
+            "afk": "aw-watcher-afk_here", "window": "aw-watcher-window_here",
+            "firefox": "aw-watcher-web-firefox_here",
+        })
+
+    def test_unique_hostless_browser_is_supported_but_ambiguous_histories_are_rejected(self):
+        self.assertEqual(select_activity_buckets({"aw-watcher-web-firefox": {"hostname": "unknown"}}, "here"),
+                         {"firefox": "aw-watcher-web-firefox"})
+        with self.assertRaisesRegex(ValueError, "Ambiguous"):
+            select_activity_buckets({
+                "aw-watcher-afk_here": {"hostname": "here"},
+                "aw-watcher-afk_duplicate": {"hostname": "here"},
+            }, "here")
 
     def test_malformed_events_do_not_break_report(self):
         events = [
@@ -121,6 +179,193 @@ class TrackingBoundaryTests(unittest.TestCase):
         self.assertEqual(result["apps"], [])
         self.assertEqual(result["latest"]["browser_url"], "")
         self.assertFalse(result["activity_enabled"])
+
+    def test_gpu_scan_reads_only_drm_descriptors_and_keeps_devices_separate(self):
+        ns = collector_namespace()
+        with tempfile.TemporaryDirectory() as temporary:
+            process = Path(temporary) / "123"
+            (process / "fd").mkdir(parents=True)
+            (process / "fdinfo").mkdir()
+            rest = ["0"] * 22
+            rest[0], rest[11], rest[19], rest[21] = "S", "100", "42", "32"
+            (process / "stat").write_text("123 (browser) " + " ".join(rest))
+            (process / "io").write_text("write_bytes: 4096\n")
+            for descriptor, target, pci in (
+                ("0", "/tmp/ordinary-file", None),
+                ("1", "/dev/dri/renderD128", "0000:00:02.0"),
+                ("2", "/dev/dri/renderD128", "0000:00:02.0"),
+                ("3", "/dev/dri/renderD129", "0000:01:00.0"),
+            ):
+                (process / "fd" / descriptor).symlink_to(target)
+                if pci:
+                    (process / "fdinfo" / descriptor).write_text(
+                        "pos: 0\n" + "extra: " + "x" * 600 + "\n"
+                        + "drm-client-id: 7\ndrm-pdev: " + pci + "\ndrm-engine-render: 1234 ns\n")
+                else:
+                    (process / "fdinfo" / descriptor).write_text("Ordinary descriptor")
+            reads = []
+            def tracked_open(path, *args, **kwargs):
+                reads.append(str(path))
+                return builtins.open(path, *args, **kwargs)
+            ns["open"] = tracked_open
+            processes, clients = ns["scan_processes"](temporary)
+        self.assertEqual(processes[123]["wr_bytes"], 4096)
+        self.assertNotIn(str(process / "fdinfo" / "0"), reads)
+        self.assertEqual(len(clients), 2)
+        self.assertEqual({client["render_ns"] for client in clients.values()}, {1234})
+
+
+class TrackingWindowTests(unittest.TestCase):
+    def setUp(self):
+        self.ns = collector_namespace()
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.conn.executescript(self.ns["SCHEMA"])
+        self.columns = self.conn.execute("PRAGMA table_info(samples)").fetchall()
+        patcher = mock.patch.object(self.ns["time"], "time", return_value=1000.75)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def sample(self, ts, **updates):
+        values = {col[1]: "" if col[2] == "TEXT" else 0 for col in self.columns}
+        values.update(ts=ts, dt=5)
+        values.update(updates)
+        self.conn.execute("INSERT INTO samples VALUES (" + ",".join("?" for _ in values) + ")", list(values.values()))
+
+    def summary(self, seconds=60):
+        return self.ns["build_summary"](self.conn, seconds / 3600)
+
+    def test_fractional_window_excludes_old_and_future_samples_everywhere(self):
+        self.sample(998, cpu_busy_pct=80, top_cpu_comm="old")
+        self.sample(999, cpu_busy_pct=20, top_cpu_comm="included")
+        self.sample(1001, cpu_busy_pct=99, top_cpu_comm="future")
+        result = self.summary(2)
+        self.assertEqual(result["window_start"], 998.75)
+        self.assertEqual(result["window_end"], 1000.75)
+        self.assertEqual(result["sample_count"], 1)
+        self.assertEqual(result["latest"]["ts"], 999)
+        self.assertEqual(result["potential"]["cpu_busy"], {"avg": 20, "max": 20, "p95": 20})
+        self.assertEqual(result["total_tracked_seconds"], .25)
+        self.assertEqual(result["hardware_tracked_seconds"], .25)
+        self.assertEqual(result["hardware_coverage_pct"], 12.5)
+        self.assertEqual([p["comm"] for p in result["top_cpu_processes"]], ["included"])
+
+    def test_empty_window_has_no_stale_latest_or_fake_zero_measurements(self):
+        self.sample(900, cpu_busy_pct=65)
+        result = self.summary(10)
+        self.assertEqual(result["sample_count"], 0)
+        self.assertEqual(result["latest"], {})
+        self.assertIsNone(result["potential"]["cpu_busy"]["avg"])
+        self.assertEqual(result["hardware_coverage_pct"], 0)
+
+    def test_nearest_rank_p95_uses_ceiling_and_ignores_missing_readings(self):
+        for ts, busy in ((995, None), (996, 10), (997, 20), (998, 90)):
+            self.sample(ts, cpu_busy_pct=busy)
+        result = self.summary()
+        self.assertEqual(result["potential"]["cpu_busy"]["p95"], 90)
+
+    def test_query_snapshot_does_not_leave_read_transaction_open(self):
+        self.conn.commit()
+        self.summary()
+        self.assertFalse(self.conn.in_transaction)
+
+    def test_missing_idle_evidence_falls_back_to_sampled_activity(self):
+        self.ns["ACTIVITY_ENABLED"] = True
+        self.sample(999, afk=0, active_app="editor")
+        class Response(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *args): self.close()
+        def response(request, **kwargs):
+            url = request.full_url if hasattr(request, "full_url") else request
+            data = {"aw-watcher-window_test": {"hostname": self.ns["socket"].gethostname()}} if url.endswith("/buckets/") else []
+            return Response(json.dumps(data).encode())
+        self.ns["compute_screen_time_summary"] = lambda **kwargs: {"active_measurement_available": False}
+        with mock.patch.object(self.ns["urllib"].request, "urlopen", side_effect=response):
+            result = self.summary()
+        self.assertEqual(result["activity_source"], "telemetry-samples")
+        self.assertIn("idle/active evidence", result["activity_warning"])
+        self.assertEqual(result["active_screen_seconds"], 5)
+
+    def test_oversized_history_is_explicit_fallback_not_silent_truncation(self):
+        self.ns["ACTIVITY_ENABLED"] = True
+        self.sample(999, afk=0, active_app="editor")
+        class Response(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *args): self.close()
+        def response(request, **kwargs):
+            url = request.full_url if hasattr(request, "full_url") else request
+            data = {"aw-watcher-afk_test": {"hostname": self.ns["socket"].gethostname()}} if url.endswith("/buckets/") else [{}] * 20001
+            return Response(json.dumps(data).encode())
+        with mock.patch.object(self.ns["urllib"].request, "urlopen", side_effect=response):
+            result = self.summary()
+        self.assertIn("20000 events", result["activity_warning"])
+        self.assertEqual(result["activity_source"], "telemetry-samples")
+        self.assertEqual(result["active_screen_seconds"], 5)
+
+    def test_spanning_activity_boundary_is_requested_with_fractional_times(self):
+        self.ns["ACTIVITY_ENABLED"] = True
+        requested = []
+        def response(request, **kwargs):
+            url = request.full_url if hasattr(request, "full_url") else request
+            requested.append(url)
+            if url.endswith("/buckets/"):
+                data = {name: {"hostname": self.ns["socket"].gethostname()} for name in (
+                    "aw-watcher-afk_test", "aw-watcher-window_test")}
+            elif "start=" in url:
+                data = []
+            else:
+                data = [{"timestamp": 995, "duration": 5, "data": {"status": "not-afk", "app": "editor"}}]
+            return io.BytesIO(json.dumps(data).encode())
+        with mock.patch.object(self.ns["urllib"].request, "urlopen", side_effect=response):
+            result = self.summary(2)
+        self.assertEqual(result["activity_source"], "activitywatch")
+        self.assertLessEqual(result["active_screen_seconds"], 1.25)
+        self.assertGreater(result["active_screen_seconds"], 1)
+        query = self.ns["urllib"].parse.parse_qs(self.ns["urllib"].parse.urlsplit(requested[1]).query)
+        self.assertTrue(query["start"][0].endswith(".750000+00:00"))
+        self.assertEqual(query["limit"], ["20001"])
+        self.assertFalse(result["apps"][0]["hardware_available"])
+
+    def test_live_sampler_rejects_future_activity_and_normalizes_domains(self):
+        self.ns["ACTIVITY_ENABLED"] = True
+        event_start = [1001]
+        def response(request, **kwargs):
+            url = request.full_url if hasattr(request, "full_url") else request
+            if url.endswith("/buckets/"):
+                data = {name: {"hostname": self.ns["socket"].gethostname()} for name in (
+                    "aw-watcher-afk_test", "aw-watcher-web-firefox_test")}
+            else:
+                data = [{"timestamp": event_start[0], "duration": 0,
+                         "data": {"status": "not-afk", "url": "https://user:secret@example.org:443/a"}}]
+            return io.BytesIO(json.dumps(data).encode())
+        with mock.patch.object(self.ns["urllib"].request, "urlopen", side_effect=response):
+            result = self.ns["query_activitywatch"]("firefox")
+            self.assertEqual(result[:2], (1, ""))
+            event_start[0] = 999
+            result = self.ns["query_activitywatch"]("firefox")
+            self.assertEqual(result[:2], (0, "example.org"))
+
+    def test_report_cli_rejects_invalid_hours_before_network_request(self):
+        ns = report_namespace()
+        for value in ("nan", "inf", "0", "-1", "2161"):
+            with self.subTest(value=value), mock.patch.object(sys, "argv", ["laptop-report", "--hours", value]):
+                with mock.patch.object(ns["urllib"].request, "urlopen") as network, contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exited:
+                        ns["main"]()
+                    self.assertEqual(exited.exception.code, 2)
+                    network.assert_not_called()
+
+    def test_report_cli_empty_window_explains_unavailable_hardware(self):
+        result = self.summary()
+        ns = report_namespace()
+        response = io.BytesIO(json.dumps(result).encode())
+        with mock.patch.object(sys, "argv", ["laptop-report", "--hours", "0.5"]):
+            with mock.patch.object(ns["urllib"].request, "urlopen", return_value=response):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    ns["main"]()
+        self.assertIn("No hardware samples in this window", output.getvalue())
+        self.assertNotIn("CPU Thread Busy", output.getvalue())
 
 
 class TelemetryHTTPTests(unittest.TestCase):

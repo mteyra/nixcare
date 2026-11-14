@@ -17,7 +17,7 @@ import tempfile
 import time
 from typing import Any
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SCHEMA_VERSION = 1
 NIX_FEATURES = ["--extra-experimental-features", "nix-command flakes"]
 
@@ -26,7 +26,7 @@ def command(argv: list[str], timeout: int = 30) -> tuple[int, str, str]:
     """Bound subprocesses and keep diagnostics separate from structured output."""
     try:
         result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout, check=False,
+            argv, capture_output=True, text=True, errors="replace", timeout=timeout, check=False,
         )
         return result.returncode, result.stdout.strip(), result.stderr.strip()
     except FileNotFoundError:
@@ -71,6 +71,9 @@ def lock_pins(data: dict[str, Any], now: float | None = None) -> list[dict[str, 
     nodes = data.get("nodes")
     if not isinstance(nodes, dict):
         raise ValueError("flake.lock has no valid nodes object")
+    root = data.get("root")
+    if not isinstance(root, str) or root not in nodes:
+        raise ValueError("flake.lock has no valid root node")
     pins = []
     for name, node in sorted(nodes.items()):
         if not isinstance(node, dict):
@@ -79,6 +82,8 @@ def lock_pins(data: dict[str, Any], now: float | None = None) -> list[dict[str, 
         original = node.get("original", {})
         if not isinstance(locked, dict) or not isinstance(original, dict):
             raise ValueError(f"Invalid lock metadata: {name}")
+        if not isinstance(node.get("inputs", {}), dict):
+            raise ValueError(f"Invalid lock inputs: {name}")
         if not locked:
             continue
         modified = locked.get("lastModified")
@@ -105,8 +110,13 @@ def compare_locks(before: dict[str, Any], after: dict[str, Any]) -> list[dict[st
     for name in sorted(old.keys() | new.keys()):
         old_locked = old.get(name, {}).get("locked")
         new_locked = new.get(name, {}).get("locked")
-        if old_locked != new_locked:
-            changes.append({"input": name, "before": old_locked, "after": new_locked})
+        old_inputs = old.get(name, {}).get("inputs", {})
+        new_inputs = new.get(name, {}).get("inputs", {})
+        if old_locked != new_locked or old_inputs != new_inputs:
+            change = {"input": name, "before": old_locked, "after": new_locked}
+            if old_inputs != new_inputs:
+                change.update(before_inputs=old_inputs, after_inputs=new_inputs)
+            changes.append(change)
     return changes
 
 
@@ -114,6 +124,12 @@ def generations(profile: Path) -> list[dict[str, Any]]:
     """Read generation links for one profile; never traverse or delete their targets."""
     matches = []
     pattern = re.compile(re.escape(profile.name) + r"-(\d+)-link$")
+    current_link = None
+    try:
+        target = Path(os.readlink(profile))
+        current_link = Path(os.path.abspath(target if target.is_absolute() else profile.parent / target))
+    except OSError:
+        pass
     for path in profile.parent.glob(profile.name + "-*-link"):
         match = pattern.fullmatch(path.name)
         if not match or not path.is_symlink():
@@ -122,7 +138,9 @@ def generations(profile: Path) -> list[dict[str, Any]]:
             matches.append({
                 "generation": int(match.group(1)),
                 "age_days": round(max(0, time.time() - path.lstat().st_mtime) / 86400, 1),
-                "current": path.resolve() == profile.resolve(),
+                # Different generations can point to the same store closure.
+                # The active profile's immediate link identifies its generation.
+                "current": path.absolute() == current_link,
             })
         except OSError:
             continue
@@ -264,12 +282,12 @@ def scan(flake: Path | None) -> dict[str, Any]:
     if platform.system() == "Linux":
         try:
             memory = linux_memory()
-            stalls = memory["pressure"].get("full", {}).get("avg60", 0)
-            pressure = memory["available_percent"] < 10 or stalls >= 1
+            stalls = memory["pressure"].get("full", {}).get("avg60")
+            pressure = memory["available_percent"] < 10 or (stalls is not None and stalls >= 1)
             message = (f"{memory['available_bytes'] / 1024**3:.1f} GiB RAM available "
                        f"({memory['available_percent']:.1f}%); "
                        f"{memory['swap_used_bytes'] / 1024**3:.1f} GiB swap in use")
-            if memory["pressure"].get("full"):
+            if stalls is not None:
                 message += f"; full memory stalls {stalls:.2f}% over 60s"
             check("memory", "warning" if pressure else "ok", message,
                   "Inspect memory-heavy processes and close unused applications; "
@@ -290,7 +308,8 @@ def scan(flake: Path | None) -> dict[str, Any]:
                 units = [line.split()[0] for line in out.splitlines() if line.strip()]
                 check(f"failed-{scope}-services", "warning" if units else "ok",
                       f"{len(units)} failed {scope} services",
-                      "Inspect failures with systemctl status UNIT and journalctl -u UNIT."
+                      f"Inspect failures with systemctl {'--user ' if scope == 'user' else ''}"
+                      f"status UNIT and journalctl {'--user ' if scope == 'user' else ''}-u UNIT."
                       if units else None, units=units)
     else:
         check("failed-services", "skipped", "systemd diagnostics only run on systemd Linux hosts.")
@@ -318,6 +337,7 @@ def check_updates(flake: Path, timeout: int = 300) -> dict[str, Any]:
     }
     try:
         source_lock = flake / "flake.lock"
+        source_definition = (flake / "flake.nix").read_bytes()
         original_bytes = source_lock.read_bytes()
         before = json.loads(original_bytes)
         lock_pins(before)
@@ -336,11 +356,24 @@ def check_updates(flake: Path, timeout: int = 300) -> dict[str, Any]:
         # Never restore over a concurrent edit; report it instead.
         if source_lock.read_bytes() != original_bytes:
             raise RuntimeError("Source flake.lock changed during the check; rerun after other edits finish.")
+        if (flake / "flake.nix").read_bytes() != source_definition:
+            raise RuntimeError("Source flake.nix changed during the check; rerun after other edits finish.")
         result["status"] = "updates-available" if result["changes"] else "current"
         result["fixed_inputs"] = [p["input"] for p in lock_pins(before) if p["fixed_revision"]]
     except (OSError, ValueError, RuntimeError, TypeError) as error:
         result["error"] = str(error)
     return result
+
+
+def validate_report_destination(path: Path | None, flake: Path | None) -> None:
+    """Protect both a flake's file names and any external symlink targets."""
+    if path is None or flake is None:
+        return
+    destination = path.expanduser().absolute()
+    for name in ("flake.nix", "flake.lock"):
+        source = (flake / name).absolute()
+        if destination == source or destination.resolve() == source.resolve():
+            raise ValueError("--output must not replace flake.nix or flake.lock")
 
 
 def write_report(path: Path, report: dict[str, Any]) -> None:
@@ -378,9 +411,12 @@ def print_report(report: dict[str, Any], as_json: bool) -> None:
     else:
         for change in report["changes"]:
             before, after = change["before"] or {}, change["after"] or {}
-            old = str(before.get("rev", before.get("narHash", "absent")))[:16]
-            new = str(after.get("rev", after.get("narHash", "absent")))[:16]
-            print(f"  {change['input']}: {old} -> {new}")
+            if before != after:
+                old = str(before.get("rev", before.get("narHash", "absent")))[:16]
+                new = str(after.get("rev", after.get("narHash", "absent")))[:16]
+                print(f"  {change['input']}: {old} -> {new}")
+            if "before_inputs" in change:
+                print(f"  {change['input']}: dependency links changed")
         if not report["changes"]:
             print("  All configured inputs match their upstream revisions.")
         if report.get("fixed_inputs"):
@@ -422,7 +458,11 @@ def main(argv: list[str] | None = None) -> int:
                   "It preserves packages and rollback generations, and may take several minutes.\n"
                   "Run nixcare optimise --apply to start. Daemon permissions may be required.")
             return 0
-        rc, out, err = nix_command(["store", "optimise"], timeout=3600)
+        try:
+            rc, out, err = nix_command(["store", "optimise"], timeout=3600)
+        except KeyboardInterrupt:
+            print("nixcare: interrupted", file=sys.stderr)
+            return 130
         if out:
             print(out)
         if err:
@@ -431,8 +471,13 @@ def main(argv: list[str] | None = None) -> int:
             print("Store optimisation completed.")
         return 0 if rc == 0 else 1
     write_attempted = False
+    flake = None
+    requested_flake = None
     try:
+        if arguments.flake:
+            requested_flake = Path(arguments.flake).expanduser().absolute()
         flake = find_flake(arguments.flake)
+        validate_report_destination(arguments.output, flake)
         if arguments.command == "check-updates":
             if arguments.timeout < 1:
                 parser.error("--timeout must be positive")
@@ -442,10 +487,6 @@ def main(argv: list[str] | None = None) -> int:
             report = scan(flake)
         if arguments.output:
             write_attempted = True
-            if flake and arguments.output.expanduser().resolve() in {
-                flake / "flake.lock", flake / "flake.nix",
-            }:
-                raise ValueError("--output must not replace flake.nix or flake.lock")
             write_report(arguments.output, report)
         print_report(report, arguments.json)
         if report["status"] == "error":
@@ -453,22 +494,23 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "check-updates":
             return 2 if arguments.fail_on_updates and report["status"] == "updates-available" else 0
         return 1 if arguments.strict and report["status"] == "warning" else 0
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, RuntimeError, KeyboardInterrupt) as error:
+        interrupted = isinstance(error, KeyboardInterrupt)
+        message = "Interrupted; no completed result is available." if interrupted else str(error)
         report = {"schema_version": SCHEMA_VERSION, "version": VERSION,
-                  "checked_at": timestamp(), "status": "error", "error": str(error)}
-        if arguments.output and not write_attempted:
-            requested_flake = Path(arguments.flake).expanduser().resolve() if arguments.flake else None
-            protected = {requested_flake / name for name in ("flake.nix", "flake.lock")} if requested_flake else set()
-            if arguments.output.expanduser().resolve() not in protected:
-                try:
-                    write_report(arguments.output, report)
-                except OSError as output_error:
-                    report["output_error"] = str(output_error)
+                  "checked_at": timestamp(), "status": "interrupted" if interrupted else "error",
+                  "error": message}
+        if arguments.output and (not write_attempted or interrupted):
+            try:
+                validate_report_destination(arguments.output, flake or requested_flake)
+                write_report(arguments.output, report)
+            except (OSError, ValueError, RuntimeError) as output_error:
+                report["output_error"] = str(output_error)
         if arguments.json:
             print(json.dumps(report))
         else:
-            print(f"nixcare: {error}", file=sys.stderr)
-        return 1
+            print(f"nixcare: {message}", file=sys.stderr)
+        return 130 if interrupted else 1
 
 
 if __name__ == "__main__":
