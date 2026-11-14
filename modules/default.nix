@@ -47,6 +47,37 @@ let
     Group = "nixcare";
     UMask = "0027";
   };
+  scheduledMaintenance = pkgs.writeShellApplication {
+    name = "nixcare-scheduled";
+    text = lib.optionalString cfg.onACPower ''
+      # A unit condition would skip this week's run entirely while on battery.
+      # Exit 75 before starting work so systemd can retry the pending run.
+      # Probe errors also exit 1, so only the explicit "no" result means battery.
+      ac_status=0
+      ac_state=$(${pkgs.systemd}/bin/systemd-ac-power --verbose) || ac_status=$?
+      case "$ac_status:$ac_state" in
+        0:yes)
+          ;;
+        1:no)
+          echo "nixcare: Waiting for AC power; scheduled maintenance will retry in 15 minutes." >&2
+          exit 75
+          ;;
+        *)
+          echo "nixcare: Cannot check AC power (systemd-ac-power exited $ac_status; state '$ac_state')." >&2
+          exit 1
+          ;;
+      esac
+    '' + ''
+      exec ${nixcareBin}/bin/nixcare "$@"
+    '';
+  };
+  retryDeferred = {
+    # Busy maintenance locks and battery deferrals happen before any work.
+    # Other failures need attention, and must not restart a partial operation.
+    Restart = "no";
+    RestartForceExitStatus = [ 75 ];
+    RestartSec = "15min";
+  };
   timer = description: dates: delay: {
     inherit description;
     wantedBy = [ "timers.target" ];
@@ -198,28 +229,25 @@ in
     systemd.timers.nixcare-check-updates = lib.mkIf cfg.update.check.enable (timer "nixcare: daily input freshness" cfg.update.check.dates "30m");
     systemd.services.nixcare-clean = lib.mkIf cfg.clean.enable {
       description = "nixcare: opted-in generation and store cleanup";
-      unitConfig.ConditionACPower = lib.mkIf cfg.onACPower true;
-      serviceConfig = stateService // lowPriority // {
-        ExecStart = "${nixcareBin}/bin/nixcare clean --apply";
+      serviceConfig = stateService // lowPriority // retryDeferred // {
+        ExecStart = "${lib.getExe scheduledMaintenance} clean --apply";
         TimeoutStartSec = "3h30min";
       };
     };
     systemd.timers.nixcare-clean = lib.mkIf cfg.clean.enable (timer "nixcare: cleanup" cfg.clean.dates "30m");
     systemd.services.nixcare-optimise = lib.mkIf cfg.optimise.enable {
       description = "nixcare: deduplicate identical store files";
-      unitConfig.ConditionACPower = lib.mkIf cfg.onACPower true;
-      serviceConfig = stateService // lowPriority // {
-        ExecStart = "${nixcareBin}/bin/nixcare optimise --apply";
+      serviceConfig = stateService // lowPriority // retryDeferred // {
+        ExecStart = "${lib.getExe scheduledMaintenance} optimise --apply";
         TimeoutStartSec = "2h10min";
       };
     };
     systemd.timers.nixcare-optimise = lib.mkIf cfg.optimise.enable (timer "nixcare: store deduplication" cfg.optimise.dates "2h");
     systemd.services.nixcare-update = lib.mkIf cfg.update.enable {
       description = "nixcare: build an isolated update candidate";
-      unitConfig.ConditionACPower = lib.mkIf cfg.onACPower true;
       environment.HOME = "/var/cache/nixcare";
-      serviceConfig = stateService // lowPriority // {
-        ExecStart = "${nixcareBin}/bin/nixcare update";
+      serviceConfig = stateService // lowPriority // retryDeferred // {
+        ExecStart = "${lib.getExe scheduledMaintenance} update";
         CacheDirectory = "nixcare";
         CacheDirectoryMode = "0750";
         TimeoutStartSec = "3h";

@@ -118,6 +118,10 @@ def require_root():
         raise RuntimeError("This action changes system state. Run it with sudo.")
 
 
+class TemporaryUnavailableError(RuntimeError):
+    """Work has not started and can be retried without changing its outcome."""
+
+
 @contextlib.contextmanager
 def maintenance_lock():
     os.makedirs(STATE_DIR, mode=0o750, exist_ok=True)
@@ -126,7 +130,7 @@ def maintenance_lock():
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise RuntimeError("Another nixcare maintenance operation is running.") from error
+            raise TemporaryUnavailableError("Another nixcare maintenance operation is running.") from error
         yield
     finally:
         os.close(fd)
@@ -815,7 +819,9 @@ def main(argv=None):
         return args.func(args) or 0
     except (RuntimeError, OSError, ValueError) as error:
         print("nixcare: " + str(error), file=sys.stderr)
-        return 1
+        # Interactive callers fail immediately; scheduled services retry only
+        # this temporary condition, never an operation that has already failed.
+        return 75 if isinstance(error, TemporaryUnavailableError) else 1
     except KeyboardInterrupt:
         print("nixcare: interrupted", file=sys.stderr)
         return 130

@@ -335,9 +335,24 @@ class CoreTest(unittest.TestCase):
 
     def test_second_maintenance_operation_rejected(self):
         with core.maintenance_lock():
-            with self.assertRaisesRegex(RuntimeError, "Another nixcare"):
+            with self.assertRaisesRegex(core.TemporaryUnavailableError, "Another nixcare"):
                 with core.maintenance_lock():
                     self.fail("concurrent maintenance entered")
+
+    def test_busy_maintenance_exits_temporary_without_work_or_report_changes(self):
+        for arguments, report_name in [(["clean", "--apply"], "clean"),
+                                       (["optimise", "--apply"], "optimise"),
+                                       (["update"], "update")]:
+            with self.subTest(command=arguments):
+                previous = {"status": "ok", "completed_at": 123}
+                core.atomic_json(core.state_file(report_name), previous)
+                errors = io.StringIO()
+                with core.maintenance_lock(), patch.object(core, "checked_cmd") as command, \
+                        contextlib.redirect_stderr(errors):
+                    self.assertEqual(core.main(arguments), 75)
+                command.assert_not_called()
+                self.assertIn("Another nixcare maintenance operation is running.", errors.getvalue())
+                self.assertEqual(json.loads(Path(core.state_file(report_name)).read_text()), previous)
 
     def test_atomic_lock_replacement_keeps_permissions(self):
         destination = self.flake / "flake.lock"

@@ -12,7 +12,7 @@ All options below live under `services.nixcare`. Import `nixcare.nixosModules.de
 | `user` | `"root"` | Existing local user to receive notifications and join the report-reading `nixcare` group |
 | `flakePath` | `"/etc/nixos"` | Absolute local system flake directory |
 | `hostName` | `config.networking.hostName` | Configuration key under `nixosConfigurations` |
-| `onACPower` | `true` | Gate scheduled cleanup, optimisation, and full builds on AC power |
+| `onACPower` | `true` | Wait for AC power before starting scheduled cleanup, optimisation, and full builds |
 | `scan.enable` | `true` | Enable the system scan timer |
 | `scan.dates` | `"daily"` | Scan calendar schedule |
 | `scan.vulnerabilities` | `true` | Run vulnix; matches are advisory, failures are reported |
@@ -64,6 +64,27 @@ services.nixcare = {
 ```
 
 Nixcare's garbage collection removes unreferenced store paths globally, not just packages from generations it pruned. Other profiles and GC roots continue to protect their referenced packages. Store optimisation shares identical files with hardlinks and does not delete generation history. It may recover little space if the store is already deduplicated.
+
+## Scheduled maintenance and retries
+
+Cleanup, store optimisation, and full candidate builds keep their weekly schedules unless you change their `dates` options. They run with low CPU/I/O priority and check for AC power before starting when `onACPower = true`.
+
+If a scheduled job finds battery power or another Nixcare maintenance operation already running, it returns temporary exit status `75`. Its systemd service retries every **15 minutes**, letting the run proceed after you plug in or the earlier operation finishes. This retry applies only to those two conditions. Ordinary errors remain visible and are not automatically retried.
+
+Deferred attempts leave the previous saved report unchanged. Check the current service and its journal to see whether work is running or waiting:
+
+```sh
+systemctl status nixcare-update.service
+journalctl -u nixcare-update.service -n 30 --no-pager
+```
+
+Cancel a pending retry by stopping its service:
+
+```sh
+sudo systemctl stop nixcare-update.service
+```
+
+Use `nixcare-clean.service` or `nixcare-optimise.service` for those jobs. Stopping the service cancels the pending retry; its timer can still start a run at the next scheduled time. To disable future runs, change that routine's `enable` option and rebuild. Stopping an actively running service interrupts its work, so check its status first.
 
 ## Home Manager
 
@@ -193,7 +214,7 @@ CPU capacity is a frequency-weighted busy estimate, not a benchmark. Application
 | Old lock input but no available update | It may be intentionally revision-pinned, or upstream may not have changed |
 | No saved report yet | Check timers or start the service once; installing the portable CLI alone creates no schedule |
 | `Permission denied` reading system reports | Start a new login session after joining `nixcare`; use `sudo nixcare status` meanwhile |
-| Heavy job skipped | Check AC power and the timer's randomized schedule |
+| Heavy job is waiting or exits `75` | Check power and other running maintenance jobs; scheduled jobs retry these conditions every 15 minutes |
 | Candidate became stale | Finish configuration edits and run `sudo nixcare update` again |
 | A snapshot build cannot resolve `../shared` | Use the full-build layout guidance above; portable `check-updates` preserves Git subdirectory context |
 | Optional report unavailable | Enable `track.enable` and inspect `laptop-telemetry.service` |

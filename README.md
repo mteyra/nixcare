@@ -102,7 +102,9 @@ Your next login picks up the `nixcare` group used to read system reports. Until 
 | Full update build | Off; enable it to prepare a candidate weekly |
 | Hardware/activity tracking | Off; separate, explicit opt-ins |
 
-Heavy scheduled jobs have low CPU/I/O priority and wait for AC power by default. Timers include a randomized delay and catch up after downtime. Nixcare does not automatically tune your CPU, change power profiles, or switch your system to an update.
+Heavy scheduled jobs have low CPU/I/O priority and wait for AC power by default. If the machine is on battery or another maintenance job is running, they retry every **15 minutes**. Ordinary failures stay visible and are not automatically retried. Weekly schedules and their randomized delays remain in place; timers catch up after downtime. [Inspect or cancel a pending retry](docs/options.md#scheduled-maintenance-and-retries).
+
+Nixcare does not automatically tune your CPU, change power profiles, or switch your system to an update.
 
 ### Prepare an update, then choose when to switch
 
