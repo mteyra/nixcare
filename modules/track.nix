@@ -3,6 +3,7 @@
 let
   cfg = config.services.nixcare;
   intersectorCode = builtins.readFile ./activity_intersector.py;
+  trackingSupportCode = builtins.readFile ./tracking_support.py;
 
   awatcherStart = pkgs.writeShellScript "awatcher-hyprland-start" ''
     set -u
@@ -31,6 +32,7 @@ let
     import pwd
     import socket
     import sqlite3
+    import stat
     import struct
     import subprocess
     import threading
@@ -40,6 +42,7 @@ let
     from datetime import datetime, timezone
 
     ${intersectorCode}
+    ${trackingSupportCode}
 
     NVME_PERCENT_USED = None
 
@@ -55,9 +58,9 @@ let
                 pass
         if max_khz > 0:
             single = max_khz / 1000.0
-            allcore = round(single * 0.92, 0)
+            allcore = single
         else:
-            single, allcore = 4000.0, 3600.0
+            single, allcore = 0.0, 0.0
         return single, allcore
 
     def find_primary_disk():
@@ -96,9 +99,9 @@ let
     DB_PATH = "/var/lib/laptop-telemetry/telemetry.db"
     OWNER_USER = "${cfg.user}"
     RETENTION_DAYS = ${toString cfg.track.retentionDays}
+    ACTIVITY_ENABLED = ${if cfg.track.activity.enable then "True" else "False"}
     PORT = 5601
     SAMPLE_INTERVAL = 5.0
-    GPU_MAX_MHZ = 1150.0
 
     SCHEMA = """
     PRAGMA journal_mode=WAL;
@@ -171,16 +174,17 @@ let
     """
 
     def enforce_private_permissions():
-        try:
-            pw = pwd.getpwnam(OWNER_USER)
-            uid, gid = pw.pw_uid, pw.pw_gid
-            os.chmod(DB_DIR, 0o700)
-            os.chown(DB_DIR, uid, gid)
-            for f in glob.glob(DB_PATH + "*"):
-                os.chmod(f, 0o600)
-                os.chown(f, uid, gid)
-        except Exception:
-            pass
+        # The privileged collector must not write user-replaceable SQLite paths.
+        if not stat.S_ISDIR(os.lstat(DB_DIR).st_mode):
+            raise RuntimeError("Telemetry state directory must not be a symlink")
+        os.chown(DB_DIR, 0, 0)
+        os.chmod(DB_DIR, 0o700)
+        for f in glob.glob(DB_PATH + "*"):
+            st = os.lstat(f)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise RuntimeError("Telemetry files must be regular files without hardlinks")
+            os.chown(f, 0, 0, follow_symlinks=False)
+            os.chmod(f, 0o600)
 
     def read_text(path, default=""):
         try:
@@ -246,7 +250,8 @@ let
                     name = parts[0]
                     vals = [int(x) for x in parts[1:]]
                     idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
-                    total = sum(vals)
+                    # guest/guest_nice are already included in user/nice.
+                    total = sum(vals[:8])
                     busy = total - idle
                     out["total" if name == "cpu" else name] = (busy, total)
         except Exception:
@@ -366,6 +371,7 @@ let
                 utime = int(rest[11])
                 stime = int(rest[12])
                 rss_pages = int(rest[21])
+                start_ticks = int(rest[19])
                 cpu_sec = (utime + stime) / float(clk_tck)
                 rss_mib = (rss_pages * page_size) / 1048576.0
             except Exception:
@@ -386,6 +392,7 @@ let
                 "cpu_sec": cpu_sec,
                 "rss_mib": rss_mib,
                 "wr_bytes": wr_bytes,
+                "start_ticks": start_ticks,
             }
 
             fdinfo_dir = pdir + "/fdinfo"
@@ -424,7 +431,10 @@ let
         return procs, drm_clients
 
     def query_hyprland():
-        socks = glob.glob("/run/user/*/hypr/*/.socket.sock")
+        if not ACTIVITY_ENABLED:
+            return "", "", "", ""
+        uid = pwd.getpwnam(OWNER_USER).pw_uid
+        socks = glob.glob(f"/run/user/{uid}/hypr/*/.socket.sock")
         if not socks:
             return "", "", "", ""
         sock_path = socks[0]
@@ -459,13 +469,15 @@ let
                     break
         return app, title, fallback_domain, fallback_tab
 
-    def query_activitywatch():
-        afk = 0
+    def query_activitywatch(active_app=""):
+        afk = 1
         domain = ""
         url = ""
         tab_title = ""
         audible = 0
         tab_count = 0
+        if not ACTIVITY_ENABLED:
+            return afk, domain, url, tab_title, audible, tab_count
         try:
             req = urllib.request.Request("http://127.0.0.1:5600/api/0/buckets/", headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=0.4) as resp:
@@ -481,20 +493,26 @@ let
                         evs = json.loads(r.read().decode("utf-8"))
                         if evs:
                             st = evs[0].get("data", {}).get("status", "")
-                            if st == "afk":
-                                afk = 1
+                            # Stale or absent AFK evidence is not active time.
+                            end = parse_iso(evs[0].get("timestamp")) + float(evs[0].get("duration") or 0)
+                            if st == "not-afk" and time.time() - end < 30:
+                                afk = 0
                 except Exception:
                     pass
 
         best_ts = ""
+        browser_family = next((name for name, apps in BROWSER_FAMILIES.items() if active_app.lower() in apps), None)
         for bid in buckets:
-            if bid.startswith("aw-watcher-web"):
+            if browser_family and bid.startswith("aw-watcher-web") and browser_family in bid.lower():
                 try:
                     u = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bid) + "/events?limit=1"
                     with urllib.request.urlopen(u, timeout=0.3) as r:
                         evs = json.loads(r.read().decode("utf-8"))
                         if evs:
                             ev = evs[0]
+                            end = parse_iso(ev.get("timestamp")) + float(ev.get("duration") or 0)
+                            if time.time() - end >= 30:
+                                continue
                             ets = ev.get("timestamp", "")
                             if ets >= best_ts:
                                 best_ts = ets
@@ -513,6 +531,7 @@ let
         return afk, domain, url, tab_title, audible, tab_count
 
     def build_summary(conn, hours=24.0):
+        hours = validate_hours(hours, RETENTION_DAYS)
         now_ts = time.time()
         since = int(now_ts - hours * 3600.0)
         window_duration = hours * 3600.0
@@ -551,6 +570,9 @@ let
         latest_row = cur.fetchone()
         cols = [d[0] for d in cur.description] if cur.description else []
         latest = dict(zip(cols, latest_row)) if latest_row else {}
+        if not ACTIVITY_ENABLED:
+            for key in ("active_app", "active_title", "browser_domain", "browser_url", "browser_tab_title"):
+                latest[key] = ""
 
         def p95(col):
             if n == 0:
@@ -612,6 +634,8 @@ let
 
         aw_summary = None
         try:
+            if not ACTIVITY_ENABLED:
+                raise RuntimeError("Activity tracking disabled")
             req = urllib.request.Request("http://127.0.0.1:5600/api/0/buckets/", headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=0.8) as resp:
                 buckets = json.loads(resp.read().decode("utf-8"))
@@ -691,13 +715,18 @@ let
             site_audible_durs = {}
             site_titles = {}
 
+            previous_end = float(since)
             for r in sample_rows:
                 r_ts, r_dt, r_afk, r_app, r_domain, r_title, r_audible = r
-                effective_dt = min(15.0, min(float(r_dt or 0.0), max(0.0, float(r_ts - since))))
+                # Clock jumps, repeated samples and suspend must not double-count.
+                end = min(now_ts, float(r_ts))
+                start = max(previous_end, float(r_ts) - min(15.0, max(0.0, float(r_dt or 0.0))))
+                effective_dt = max(0.0, end - start)
+                previous_end = max(previous_end, end)
                 if effective_dt <= 0:
                     continue
                 total_tracked_raw += effective_dt
-                if r_afk == 0:
+                if ACTIVITY_ENABLED and r_afk == 0:
                     active_screen_raw += effective_dt
                     app_name = r_app or "(unfocused/desktop)"
                     app_durations[app_name] = app_durations.get(app_name, 0.0) + effective_dt
@@ -717,7 +746,7 @@ let
                 st = app_stats.get(app, {})
                 apps.append({
                     "app": app,
-                    "seconds": round(sec, 1),
+                    "seconds": duration_seconds(sec),
                     "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
                     "avg_cpu_potential_pct": st.get("avg_cpu_potential_pct", 0.0),
                     "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
@@ -732,7 +761,7 @@ let
 
             for site, sec in sorted(site_durations.items(), key=lambda x: x[1], reverse=True)[:25]:
                 st = site_stats.get(site, {})
-                adj_sec = round(sec * scale, 1)
+                adj_sec = duration_seconds(sec * scale)
                 tabs.append({
                     "site": site,
                     "title": site_titles.get(site, ""),
@@ -740,7 +769,7 @@ let
                     "avg_cpu_pct": st.get("avg_cpu_pct", 0.0),
                     "avg_gpu_pct": st.get("avg_gpu_pct", 0.0),
                     "avg_watts": st.get("avg_watts", 0.0),
-                    "audible_seconds": round(site_audible_durs.get(site, 0.0), 1),
+                    "audible_seconds": duration_seconds(site_audible_durs.get(site, 0.0) * scale),
                 })
 
         # Top processes
@@ -766,6 +795,8 @@ let
 
         return {
             "window_hours": hours,
+            "activity_enabled": ACTIVITY_ENABLED,
+            "compute_metric": "Frequency-weighted CPU busy estimate; not benchmarked compute capacity.",
             "sample_count": n,
             "total_tracked_seconds": round(total_tracked_seconds, 1),
             "active_screen_seconds": round(active_screen_seconds, 1),
@@ -773,11 +804,11 @@ let
             "potential": {
                 "cpu_busy": {"avg": round(row[3] or 0, 1), "p95": round(p95("cpu_busy_pct"), 1), "max": round(row[4] or 0, 1)},
                 "cpu_single_thread": {"avg": round(row[5] or 0, 1), "p95": round(p95("cpu_max_thread_pct"), 1), "max": round(row[6] or 0, 1)},
-                "cpu_freq_mhz": {"avg": round(row[7] or 0, 0), "max": round(row[8] or 0, 0), "ceiling": 4200},
+                "cpu_freq_mhz": {"avg": round(row[7] or 0, 0), "max": round(row[8] or 0, 0), "ceiling": CPU_SINGLE_TURBO_MHZ or None},
                 "cpu_true_potential": {"avg": round(row[9] or 0, 1), "p95": round(p95("cpu_potential_pct"), 1), "max": round(row[10] or 0, 1)},
                 "gpu_render": {"avg": round(row[11] or 0, 1), "p95": round(p95("gpu_render_pct"), 1), "max": round(row[12] or 0, 1)},
                 "gpu_video_decode": {"avg": round(row[13] or 0, 1), "p95": round(p95("gpu_video_pct"), 1), "max": round(row[14] or 0, 1)},
-                "gpu_freq_mhz": {"avg": round(row[15] or 0, 0), "max": round(row[16] or 0, 0), "ceiling": 1150},
+                "gpu_freq_mhz": {"avg": round(row[15] or 0, 0), "max": round(row[16] or 0, 0)},
                 "ram_pct": {"avg": round(row[17] or 0, 1), "p95": round(p95("mem_used_pct"), 1), "max": round(row[18] or 0, 1)},
                 "ram_used_max_mib": round(row[19] or 0, 0),
                 "ram_avail_min_mib": round(row[20] or 0, 0),
@@ -790,8 +821,8 @@ let
                 "psi_cpu_some": {"avg": round(row[30] or 0, 2), "max": round(row[31] or 0, 2)},
                 "psi_mem_some": {"avg": round(row[32] or 0, 2), "max": round(row[33] or 0, 2)},
                 "psi_io_some": {"avg": round(row[34] or 0, 2), "max": round(row[35] or 0, 2)},
-                "pkg_watts": {"avg": round(row[36] or 0, 2), "p95": round(p95("pkg_watts"), 2), "max": round(row[37] or 0, 2), "sustained_ceiling": 15.0, "turbo_ceiling": 44.0},
-                "cpu_temp_c": {"avg": round(row[38] or 0, 1), "max": round(row[39] or 0, 1), "throttle_ceiling": 97.0},
+                "pkg_watts": {"avg": round(row[36] or 0, 2), "p95": round(p95("pkg_watts"), 2), "max": round(row[37] or 0, 2)},
+                "cpu_temp_c": {"avg": round(row[38] or 0, 1), "max": round(row[39] or 0, 1)},
                 "throttled_ever": {"thermal": bool(row[40]), "prochot": bool(row[41]), "power_limit": bool(row[42])},
                 "battery_health_pct": round(row[43] or 0, 1),
                 "nvme_percent_used": NVME_PERCENT_USED,
@@ -806,6 +837,7 @@ let
     <html lang="en">
     <head>
       <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>nixcare — Hardware Potential & Screen Time</title>
       <style>
         :root {
@@ -831,11 +863,12 @@ let
     </head>
     <body>
       <h1>nixcare — Hardware Potential & Screen Time</h1>
-      <div class="sub" id="status">Loading telemetry... (100% local SQLite DB [0600] + ActivityWatch on <a href="http://127.0.0.1:5600" target="_blank">127.0.0.1:5600</a>)</div>
+      <div class="sub" id="status" role="status">Loading local telemetry...</div>
+      <div class="sub">CPU capacity is a frequency-weighted estimate. Application rows show whole-system load while an app is focused, not energy attributable to that app. Missing sensor support may appear as zero. Reports are available to local users of this computer.</div>
       <div class="grid" id="gauges"></div>
       <div class="grid">
         <div class="card">
-          <h2>Screen Time & Energy by Application</h2>
+          <h2>Screen Time & System Load During Focus</h2>
           <table id="apps-table"><thead><tr><th>App</th><th>Time</th><th>CPU %</th><th>GPU %</th><th>Avg W</th></tr></thead><tbody></tbody></table>
         </div>
         <div class="card">
@@ -854,6 +887,11 @@ let
       </div>
       </div>
       <script>
+        function escapeHtml(value) {
+          return String(value == null ? "" : value).replace(/[&<>"']/g, function(c) {
+            return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+          });
+        }
         function fmtDur(s) {
           if (s < 60) return Math.round(s) + "s";
           if (s < 3600) return Math.floor(s/60) + "m " + Math.round(s%60) + "s";
@@ -869,91 +907,145 @@ let
         }
         async function refresh() {
           var r = await fetch("/api/summary?hours=24");
+          if (!r.ok) throw new Error("Telemetry returned HTTP " + r.status);
           var d = await r.json();
           var L = d.latest || {};
           var P = d.potential;
           document.getElementById("status").innerHTML =
             "Samples: <b>" + d.sample_count + "</b> | Active screen time: <b>" + fmtDur(d.active_screen_seconds) + "</b> | " +
-            "Profile: <b>" + (L.power_profile || "?") + "</b> (" + (L.epp || "?") + ") | Focused: <b>" + (L.active_app || "none") + "</b> | " +
-            'Raw ActivityWatch UI: <a href="http://127.0.0.1:5600" target="_blank">127.0.0.1:5600</a>';
+            "Profile: <b>" + escapeHtml(L.power_profile || "?") + "</b> (" + escapeHtml(L.epp || "?") + ") | Focused: <b>" + escapeHtml(L.active_app || "none") + "</b> | " +
+            (d.activity_enabled ? 'ActivityWatch: <a href="http://127.0.0.1:5600" target="_blank" rel="noreferrer">127.0.0.1:5600</a>' : "Activity tracking disabled");
           document.getElementById("gauges").innerHTML =
             '<div class="card">' +
-              '<h2>CPU Potential (i7-8650U 4C/8T)</h2>' +
-              bar("True Compute Potential (vs 3.9 GHz Turbo)", (L.cpu_potential_pct||0).toFixed(1), P.cpu_true_potential.avg, P.cpu_true_potential.max) +
-              bar("Thread Busy (all 8 threads)", (L.cpu_busy_pct||0).toFixed(1), P.cpu_busy.avg, P.cpu_busy.max) +
+              '<h2>CPU Utilization</h2>' +
+              bar("Frequency-weighted busy estimate", (L.cpu_potential_pct||0).toFixed(1), P.cpu_true_potential.avg, P.cpu_true_potential.max) +
+              bar("Thread Busy (all threads)", (L.cpu_busy_pct||0).toFixed(1), P.cpu_busy.avg, P.cpu_busy.max) +
               bar("Busiest Single Thread (single-core ceiling)", (L.cpu_max_thread_pct||0).toFixed(1), P.cpu_single_thread.avg, P.cpu_single_thread.max) +
-              '<div class="sub">Clock: <b>' + Math.round(L.cpu_avg_mhz||0) + ' MHz</b> (peak ' + P.cpu_freq_mhz.max + ' / 4200 MHz) | Top: <b>' + (L.top_cpu_comm||"-") + '</b></div>' +
+              '<div class="sub">Clock: <b>' + Math.round(L.cpu_avg_mhz||0) + ' MHz</b> (peak ' + P.cpu_freq_mhz.max + ' MHz) | Top: <b>' + escapeHtml(L.top_cpu_comm||"-") + '</b></div>' +
             '</div>' +
             '<div class="card">' +
-              '<h2>GPU Potential (Intel UHD 620)</h2>' +
+              '<h2>GPU Engines (when supported)</h2>' +
               bar("3D / Render Engine (Compositor / WebGL)", (L.gpu_render_pct||0).toFixed(1), P.gpu_render.avg, P.gpu_render.max) +
               bar("Hardware Video Decode (VA-API QuickSync)", (L.gpu_video_pct||0).toFixed(1), P.gpu_video_decode.avg, P.gpu_video_decode.max) +
-              '<div class="sub">GPU Clock: <b>' + Math.round(L.gpu_freq_mhz||0) + ' MHz</b> / 1150 MHz | Top GPU: <b>' + (L.top_gpu_comm||"-") + '</b></div>' +
+              '<div class="sub">GPU Clock: <b>' + Math.round(L.gpu_freq_mhz||0) + ' MHz</b> | Top GPU: <b>' + escapeHtml(L.top_gpu_comm||"-") + '</b></div>' +
             '</div>' +
             '<div class="card">' +
-              '<h2>RAM & Compressed Swap (16 GiB)</h2>' +
+              '<h2>RAM & Compressed Swap</h2>' +
               bar("RAM Used (excl. reclaimable cache)", (L.mem_used_pct||0).toFixed(1), P.ram_pct.avg, P.ram_pct.max) +
               '<div class="sub">Used: <b>' + Math.round(L.mem_used_mib||0) + ' MiB</b> | Avail: <b>' + Math.round(L.mem_avail_mib||0) + ' MiB</b> | zram: <b>' + (L.zram_orig_mib||0).toFixed(0) + "→" + (L.zram_compr_mib||0).toFixed(0) + ' MiB</b> | zswap: <b>' + (L.zswap_mib||0).toFixed(0) + ' MiB</b></div>' +
             '</div>' +
             '<div class="card">' +
               '<h2>Power, Thermal & NVMe I/O</h2>' +
               bar("NVMe Busy %", (L.disk_busy_pct||0).toFixed(1), P.nvme_busy_pct.avg, P.nvme_busy_pct.max) +
-              '<div class="sub">CPU Power: <b>' + (L.pkg_watts||0).toFixed(1) + ' W</b> (avg ' + P.pkg_watts.avg + ' W, peak ' + P.pkg_watts.max + ' W) | Temp: <b>' + (L.cpu_temp_c||0).toFixed(0) + '°C</b> (max ' + P.cpu_temp_c.max + '°C / 97°C) | Battery Health: <b>' + P.battery_health_pct + '%</b></div>' +
+              '<div class="sub">CPU Power: <b>' + (L.pkg_watts||0).toFixed(1) + ' W</b> (avg ' + P.pkg_watts.avg + ' W, peak ' + P.pkg_watts.max + ' W) | Temp: <b>' + (L.cpu_temp_c||0).toFixed(0) + '°C</b> (max ' + P.cpu_temp_c.max + '°C) | Battery Health: <b>' + P.battery_health_pct + '%</b></div>' +
             '</div>';
           document.querySelector("#apps-table tbody").innerHTML = d.apps.map(function(a) {
-            return "<tr><td><b>" + a.app + "</b></td><td>" + fmtDur(a.seconds) + "</td><td>" + a.avg_cpu_pct + "%</td><td>" + a.avg_gpu_pct + "%</td><td>" + a.avg_watts + "W</td></tr>";
+            return "<tr><td><b>" + escapeHtml(a.app) + "</b></td><td>" + fmtDur(a.seconds) + "</td><td>" + a.avg_cpu_pct + "%</td><td>" + a.avg_gpu_pct + "%</td><td>" + a.avg_watts + "W</td></tr>";
           }).join("");
           document.querySelector("#tabs-table tbody").innerHTML = d.browser_tabs.map(function(t) {
-            return '<tr><td title="' + t.title + '"><b>' + t.site.slice(0,48) + "</b></td><td>" + fmtDur(t.seconds) + "</td><td>" + t.avg_cpu_pct + "%</td><td>" + t.avg_gpu_pct + "%</td><td>" + fmtDur(t.audible_seconds) + "</td></tr>";
+            return '<tr><td title="' + escapeHtml(t.title) + '"><b>' + escapeHtml(t.site.slice(0,48)) + "</b></td><td>" + fmtDur(t.seconds) + "</td><td>" + t.avg_cpu_pct + "%</td><td>" + t.avg_gpu_pct + "%</td><td>" + fmtDur(t.audible_seconds) + "</td></tr>";
           }).join("");
           document.querySelector("#cpu-table tbody").innerHTML = d.top_cpu_processes.map(function(p) {
-            return "<tr><td><b>" + p.comm + "</b></td><td>" + p.avg_pct + "%</td><td>" + p.max_pct + "%</td></tr>";
+            return "<tr><td><b>" + escapeHtml(p.comm) + "</b></td><td>" + p.avg_pct + "%</td><td>" + p.max_pct + "%</td></tr>";
           }).join("");
           document.querySelector("#io-table tbody").innerHTML = d.top_io_processes.map(function(p) {
-            return "<tr><td><b>" + p.comm + "</b></td><td>" + p.avg_kibs + " KiB/s</td><td>" + p.max_kibs + " KiB/s</td></tr>";
+            return "<tr><td><b>" + escapeHtml(p.comm) + "</b></td><td>" + p.avg_kibs + " KiB/s</td><td>" + p.max_kibs + " KiB/s</td></tr>";
           }).join("");
         }
-        refresh();
-        setInterval(refresh, 5000);
+        async function tick() {
+          try { await refresh(); }
+          catch (error) { document.getElementById("status").textContent = "Telemetry unavailable: " + error.message; }
+          setTimeout(tick, 15000);
+        }
+        tick();
       </script>
     </body>
     </html>
     """
 
+    SUMMARY_CACHE = SummaryCache()
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
 
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+            super().end_headers()
+
         def do_GET(self):
+            if not local_request_allowed(self.headers, PORT):
+                self.send_error(403, "Only same-origin loopback requests are permitted")
+                return
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/api/summary":
                 qs = urllib.parse.parse_qs(parsed.query)
-                hours = float(qs.get("hours", ["24"])[0])
-                conn = sqlite3.connect("file:" + DB_PATH + "?mode=ro", uri=True)
                 try:
-                    data = build_summary(conn, hours)
-                finally:
-                    conn.close()
+                    hours = validate_hours(qs.get("hours", ["24"])[0], RETENTION_DAYS)
+                except ValueError as error:
+                    self.send_error(400, str(error))
+                    return
+                def read_summary():
+                    conn = sqlite3.connect("file:" + DB_PATH + "?mode=ro", uri=True, timeout=2)
+                    try:
+                        return build_summary(conn, hours)
+                    finally:
+                        conn.close()
+                try:
+                    data = SUMMARY_CACHE.get(hours, read_summary)
+                except (sqlite3.Error, OSError):
+                    self.send_error(503, "Telemetry database is temporarily unavailable")
+                    return
                 body = json.dumps(data, indent=2).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-            else:
+            elif parsed.path == "/":
                 body = DASHBOARD_HTML.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            else:
+                self.send_error(404, "Not found")
+
+    class TelemetryServer(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+
+        def __init__(self, *args, **kwargs):
+            self.request_slots = threading.BoundedSemaphore(4)
+            super().__init__(*args, **kwargs)
+
+        def process_request(self, request, client_address):
+            if not self.request_slots.acquire(blocking=False):
+                self.shutdown_request(request)
+                return
+            request.settimeout(5)
+            try:
+                super().process_request(request, client_address)
+            except Exception:
+                self.request_slots.release()
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self.request_slots.release()
 
     def serve_http():
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+        srv = TelemetryServer(("127.0.0.1", PORT), Handler)
         srv.serve_forever()
 
     def main():
-        os.makedirs(DB_DIR, exist_ok=True)
+        os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
+        enforce_private_permissions()
         conn = sqlite3.connect(DB_PATH)
         conn.executescript(SCHEMA)
         conn.commit()
@@ -1007,7 +1099,7 @@ let
                         cpu_max_thread_pct = pct
 
             avg_mhz, max_mhz = read_cpu_freqs()
-            cpu_potential_pct = min(100.0, cpu_busy_pct * (avg_mhz / CPU_ALLCORE_TURBO_MHZ))
+            cpu_potential_pct = min(100.0, cpu_busy_pct * (avg_mhz / CPU_ALLCORE_TURBO_MHZ)) if CPU_ALLCORE_TURBO_MHZ else 0.0
             try:
                 load1 = float(read_text("/proc/loadavg", "0").split()[0])
             except Exception:
@@ -1036,7 +1128,7 @@ let
             for pid, pinfo in cur_procs.items():
                 comm = pinfo["comm"]
                 mem_by_comm[comm] = mem_by_comm.get(comm, 0.0) + pinfo["rss_mib"]
-                if pid in prev_procs and prev_procs[pid]["comm"] == comm:
+                if pid in prev_procs and prev_procs[pid]["start_ticks"] == pinfo["start_ticks"]:
                     dcpu = max(0.0, pinfo["cpu_sec"] - prev_procs[pid]["cpu_sec"])
                     cpu_by_comm[comm] = cpu_by_comm.get(comm, 0.0) + (dcpu / dt) * 100.0
                     dwr = max(0, pinfo["wr_bytes"] - prev_procs[pid]["wr_bytes"])
@@ -1067,7 +1159,7 @@ let
             gpu_render_pct = min(100.0, (render_ns_delta / (dt * 1e9)) * 100.0)
             gpu_video_pct = min(100.0, (video_ns_delta / (dt * 1e9)) * 100.0)
             gpu_copy_pct = min(100.0, (copy_ns_delta / (dt * 1e9)) * 100.0)
-            gpu_freq_mhz = read_float("/sys/class/drm/card1/gt_act_freq_mhz", 0.0)
+            gpu_freq_mhz = max((read_float(p, 0.0) for p in glob.glob("/sys/class/drm/card*/gt_act_freq_mhz")), default=0.0)
             top_gpu_comm, top_gpu_pct = ("", 0.0)
             if gpu_by_comm:
                 top_gpu_comm, top_gpu_pct = max(gpu_by_comm.items(), key=lambda x: x[1])
@@ -1096,7 +1188,7 @@ let
             core_watts = rapl_w("core")
             uncore_watts = rapl_w("uncore")
             dram_watts = rapl_w("dram")
-            rapl_pl1_watts = read_int("/sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw", 44000000) / 1e6
+            rapl_pl1_watts = read_int("/sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw", 0) / 1e6
 
             cpu_temp_c, nvme_temp_c = read_temps()
             ac_online = read_int("/sys/class/power_supply/AC/online", 0)
@@ -1122,7 +1214,7 @@ let
                 bat_health_pct = (efull / edesign * 100.0) if edesign > 0 else 100.0
 
             active_app, active_title, fb_domain, fb_tab = query_hyprland()
-            afk, aw_domain, aw_url, aw_tab_title, aw_audible, aw_tab_count = query_activitywatch()
+            afk, aw_domain, aw_url, aw_tab_title, aw_audible, aw_tab_count = query_activitywatch(active_app)
 
             is_browser = is_browser_app(active_app)
             browser_domain = (aw_domain if aw_domain else fb_domain) if is_browser else ""
@@ -1214,7 +1306,7 @@ let
             L.get("power_profile", "?"), L.get("epp", "?"), L.get("ac_online", 0), P["battery_health_pct"]))
         print("-" * 78)
         print(" HARDWARE POTENTIAL UTILIZATION (System capacity & workload ceilings)")
-        print("  CPU True Compute (vs all-core ceiling) : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
+        print("  CPU Frequency-Weighted Busy (estimate): cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
             L.get("cpu_potential_pct", 0), P["cpu_true_potential"]["avg"], P["cpu_true_potential"]["p95"], P["cpu_true_potential"]["max"]))
         print("  CPU Thread Busy (all active threads)   : cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
             L.get("cpu_busy_pct", 0), P["cpu_busy"]["avg"], P["cpu_busy"]["p95"], P["cpu_busy"]["max"]))
@@ -1232,12 +1324,12 @@ let
             L.get("zram_orig_mib", 0), L.get("zram_compr_mib", 0), L.get("zswap_mib", 0)))
         print("  Disk Busy & Write Rate (Primary Drive) : busy avg %4.1f%% (peak %4.1f%%) | write avg %6.1f KiB/s (peak %6.1f KiB/s)" % (
             P["nvme_busy_pct"]["avg"], P["nvme_busy_pct"]["max"], P["nvme_write_kibs"]["avg"], P["nvme_write_kibs"]["max"]))
-        print("  Package Power & Thermal Headroom   : %4.1f W (avg %4.1f W, peak %4.1f W / 44W) | %4.0f C (peak %4.0f C / 97 C)" % (
+        print("  Package Power & Temperature       : %4.1f W (avg %4.1f W, peak %4.1f W) | %4.0f C (peak %4.0f C)" % (
             L.get("pkg_watts", 0), P["pkg_watts"]["avg"], P["pkg_watts"]["max"], L.get("cpu_temp_c", 0), P["cpu_temp_c"]["max"]))
         print("  Kernel PSI Stalls (CPU / Mem / IO) : CPU avg %.2f%% | Mem avg %.2f%% | IO avg %.2f%%" % (
             P["psi_cpu_some"]["avg"], P["psi_mem_some"]["avg"], P["psi_io_some"]["avg"]))
         print("-" * 78)
-        print(" SCREEN TIME & HARDWARE COST BY APPLICATION")
+        print(" SCREEN TIME & WHOLE-SYSTEM LOAD WHILE APPLICATION IS FOCUSED")
         for a in data["apps"][:12]:
             print("  %-28s  %8s  | CPU %5.1f%% (pot %4.1f%%) | GPU %4.1f%% | %4.1f W" % (
                 a["app"][:28], fmt_dur(a["seconds"]), a["avg_cpu_pct"], a["avg_cpu_potential_pct"], a["avg_gpu_pct"], a["avg_watts"]))
@@ -1258,21 +1350,24 @@ let
 in
 {
   config = lib.mkIf (cfg.enable && cfg.track.enable) {
-    systemd.user.services.aw-server-rust = {
+    systemd.user.services.aw-server-rust = lib.mkIf cfg.track.activity.enable {
       description = "ActivityWatch local time-tracking server (Rust)";
       wantedBy = [ "default.target" ];
+      unitConfig.ConditionUser = cfg.user;
       serviceConfig = {
         ExecStart = "${pkgs.aw-server-rust}/bin/aw-server --host 127.0.0.1 --port 5600";
         Restart = "always";
         RestartSec = 2;
+        UMask = "0077";
       };
     };
 
-    systemd.user.services.awatcher = {
+    systemd.user.services.awatcher = lib.mkIf cfg.track.activity.enable {
       description = "ActivityWatch Wayland/Hyprland window and idle watcher";
       after = [ "aw-server-rust.service" ];
       wants = [ "aw-server-rust.service" ];
       wantedBy = [ "default.target" ];
+      unitConfig.ConditionUser = cfg.user;
       serviceConfig = {
         ExecStart = awatcherStart;
         Restart = "always";
@@ -1280,7 +1375,7 @@ in
       };
     };
 
-    programs.firefox.policies = {
+    programs.firefox.policies = lib.mkIf cfg.track.browserExtensions.enable {
       ExtensionSettings = {
         "{ef87d84c-2127-493f-b952-5b4e744245bc}" = {
           installation_mode = "force_installed";
@@ -1292,7 +1387,8 @@ in
       };
     };
 
-    programs.chromium = {
+    programs.chromium = lib.mkIf cfg.track.browserExtensions.enable {
+      # This enables policy files for Chromium/Chrome; it does not install a browser.
       enable = true;
       extensions = [
         "nglaklhklhcoonedhgnpgddginnjdadi;https://clients2.google.com/service/update2/crx"
@@ -1311,13 +1407,19 @@ in
         UMask = "0077";
         Restart = "always";
         RestartSec = 2;
+        Nice = 10;
+        IOSchedulingClass = "idle";
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = "read-only";
+        ReadWritePaths = [ "/var/lib/laptop-telemetry" ];
+        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" ];
       };
     };
 
-    environment.systemPackages = [
+    environment.systemPackages = [ laptopReportBin ] ++ lib.optionals cfg.track.activity.enable [
       pkgs.aw-server-rust
       pkgs.awatcher
-      laptopReportBin
     ];
   };
 }

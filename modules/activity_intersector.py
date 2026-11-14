@@ -8,6 +8,7 @@ Guarantees 3 core invariants:
 3. sum(apps) <= active time <= tracked
 """
 
+import math
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -26,6 +27,11 @@ BROWSER_FAMILIES = {
 }
 
 ALL_BROWSER_APPS = set.union(*BROWSER_FAMILIES.values())
+
+
+def duration_seconds(value):
+    """Round attributed durations down so many tiny rows cannot invent time."""
+    return math.floor(max(0.0, value) * 10 + 1e-9) / 10
 
 
 def is_browser_app(app_name):
@@ -52,18 +58,24 @@ def clip_events(events, t_start, t_end):
     """
     clipped = []
     for ev in events:
-        if isinstance(ev, (list, tuple)):
-            s = float(ev[0])
-            e = float(ev[1])
-            data = ev[2] if len(ev) > 2 else {}
-        else:
-            ts = ev.get("timestamp") if "timestamp" in ev else ev.get("start")
-            if ts is None:
+        try:
+            if isinstance(ev, (list, tuple)):
+                s = float(ev[0])
+                e = float(ev[1])
+                data = ev[2] if len(ev) > 2 else {}
+            else:
+                ts = ev.get("timestamp") if "timestamp" in ev else ev.get("start")
+                if ts is None:
+                    continue
+                s = parse_iso(ts)
+                e = float(ev["end"]) if "end" in ev else s + float(ev.get("duration", 0.0) or 0.0)
+                data = ev.get("data", {})
+            if not math.isfinite(s) or not math.isfinite(e):
                 continue
-            s = parse_iso(ts)
-            dur = float(ev.get("duration", 0.0) or 0.0)
-            e = s + dur
-            data = ev.get("data", {})
+            if not isinstance(data, dict):
+                data = {}
+        except (TypeError, ValueError, IndexError, AttributeError, OverflowError):
+            continue
 
         s_c = max(s, t_start)
         e_c = min(e, t_end)
@@ -150,11 +162,8 @@ def extract_site_domain(url, title=""):
         return title or "(browser)"
     try:
         parsed = urllib.parse.urlparse(url)
-        netloc = parsed.netloc
+        netloc = parsed.hostname
         if netloc:
-            # Strip port if present
-            if ":" in netloc:
-                netloc = netloc.split(":", 1)[0]
             return netloc
         if parsed.scheme in ("about", "chrome", "moz-extension"):
             return parsed.scheme + ":" + (parsed.path or "")
@@ -193,7 +202,7 @@ def compute_screen_time_summary(
     window_duration = max(0.0, float(window_end - window_start))
 
     # 1. Clip and merge AFK events
-    clipped_afk = clip_events(afk_events, window_start, window_end)
+    clipped_afk = make_disjoint(clip_events(afk_events, window_start, window_end))
 
     # Tracked time: union of all AFK events (afk + not-afk)
     tracked_ivs = merge_intervals([(s, e, d) for s, e, d in clipped_afk])
@@ -240,7 +249,7 @@ def compute_screen_time_summary(
 
     # Sort apps descending
     apps_list = [
-        {"app": app, "seconds": round(sec, 1)}
+        {"app": app, "seconds": duration_seconds(sec)}
         for app, sec in sorted(app_durations.items(), key=lambda x: x[1], reverse=True)
     ]
 
@@ -291,8 +300,8 @@ def compute_screen_time_summary(
                     "site": site,
                     "title": site_title.get(site, ""),
                     "browser": b_key,
-                    "seconds": round(sec, 1),
-                    "audible_seconds": round(site_audible.get(site, 0.0), 1),
+                    "seconds": duration_seconds(sec),
+                    "audible_seconds": duration_seconds(site_audible.get(site, 0.0)),
                 })
 
     # Sort tabs overall by seconds descending
