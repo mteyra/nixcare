@@ -1,10 +1,12 @@
 # Nixcare
 
+[![Tests](https://github.com/mteyra/nixcare/actions/workflows/ci.yml/badge.svg)](https://github.com/mteyra/nixcare/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/mteyra/nixcare)](https://github.com/mteyra/nixcare/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Know what needs attention. Make Nix maintenance a routine.**
 
 Nixcare checks your Nix installation, explains findings, and helps you prepare updates. Run one command on Linux or macOS, or add it to your NixOS configuration for scheduled checks and store maintenance.
 
-[Website](https://mteyra.github.io/nixcare/) · [Configuration & troubleshooting](docs/options.md) · [Contributing](CONTRIBUTING.md) · [MIT license](LICENSE)
+[Website](https://mteyra.github.io/nixcare/) · [Configuration & troubleshooting](docs/options.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [MIT license](LICENSE)
 
 ## Quick start
 
@@ -37,7 +39,7 @@ Enable flakes for this one invocation:
 nix --extra-experimental-features 'nix-command flakes' run github:mteyra/nixcare -- doctor
 ```
 
-Older Nix versions call `nix profile add` **`nix profile install`**. For a traditional installation using your configured `<nixpkgs>`:
+On older Nix versions, use `nix profile install` instead of `nix profile add`. For a traditional installation using your configured `<nixpkgs>`:
 
 ```sh
 nix-env -if https://github.com/mteyra/nixcare/archive/refs/tags/v0.2.1.tar.gz

@@ -473,11 +473,9 @@ def cmd_scan(args):
 
     # 5. Security (agent bridge mode, telemetry DB mode, listening sockets)
     db_mode = None
-    db_owner = None
     if os.path.exists(TELEMETRY_DB):
         st = os.stat(TELEMETRY_DB)
         db_mode = oct(st.st_mode & 0o777)
-        db_owner = st.st_uid
 
     ss_rc, ss_out, ss_err = run_cmd(["ss", "-tulnpH"])
     if ss_rc:
@@ -602,7 +600,7 @@ def cache_plan(now=None):
         latest = 0
         size = 0
         safe = True
-        for directory, dirs, files in os.walk(path, followlinks=False):
+        for directory, _dirs, files in os.walk(path, followlinks=False):
             for entry in [directory] + [os.path.join(directory, item) for item in files]:
                 info = os.lstat(entry)
                 if info.st_uid != owner_uid:
