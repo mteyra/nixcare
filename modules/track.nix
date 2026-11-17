@@ -477,7 +477,7 @@ let
                     break
         return app, title, fallback_domain, fallback_tab
 
-    def query_activitywatch(active_app=""):
+    def query_activitywatch(active_app="", active_title=""):
         afk = 1
         domain = ""
         url = ""
@@ -493,36 +493,50 @@ let
         except Exception:
             return afk, domain, url, tab_title, audible, tab_count
 
-        def latest_event(bucket_id):
-            u = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bucket_id, safe="") + "/events?limit=1"
+        def recent_events(bucket_id, limit=1, max_age=30.0):
+            u = "http://127.0.0.1:5600/api/0/buckets/" + urllib.parse.quote(bucket_id, safe="") + "/events?limit=" + str(limit)
             with urllib.request.urlopen(u, timeout=0.3) as response:
                 events = read_json_bounded(response)
-            if not isinstance(events, list) or not events or not isinstance(events[0], dict):
-                return None
-            event = events[0]
-            start = parse_iso(event.get("timestamp"))
-            duration = float(event.get("duration") or 0)
-            end = start + duration
-            # Future, stale, malformed or absent evidence is not active time.
-            if duration < 0 or not math.isfinite(start) or not math.isfinite(end) or not 0 <= time.time() - end < 30:
-                return None
-            return event
+            if not isinstance(events, list):
+                return []
+            valid = []
+            now_check = time.time()
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                start = parse_iso(event.get("timestamp"))
+                duration = float(event.get("duration") or 0)
+                end = start + duration
+                # Future, stale, malformed or absent evidence is not active time.
+                if duration < 0 or not math.isfinite(start) or not math.isfinite(end) or not 0 <= now_check - end < max_age:
+                    continue
+                valid.append(event)
+            return valid
 
         try:
-            event = latest_event(buckets["afk"]) if "afk" in buckets else None
-            if event and event.get("data", {}).get("status") == "not-afk":
+            events = recent_events(buckets["afk"], limit=1, max_age=30.0) if "afk" in buckets else []
+            if events and events[0].get("data", {}).get("status") == "not-afk":
                 afk = 0
         except Exception:
             pass
 
         browser_family = next((name for name, apps in BROWSER_FAMILIES.items() if active_app.lower() in apps), None)
         try:
-            event = latest_event(buckets[browser_family]) if browser_family in buckets else None
-            if event:
-                data = event.get("data", {})
+            events = recent_events(buckets[browser_family], limit=5, max_age=75.0) if browser_family in buckets else []
+            if events:
+                clean_win_title = strip_browser_suffix(active_title)
+                chosen = events[0]
+                if clean_win_title:
+                    for ev in events:
+                        if str(ev.get("data", {}).get("title") or "").strip() == clean_win_title:
+                            chosen = ev
+                            break
+                data = chosen.get("data", {})
                 url = str(data.get("url") or "")
                 tab_title = str(data.get("title") or "")
                 audible = 1 if data.get("audible") else 0
+                if audible == 1:
+                    afk = 0
                 tab_count = max(0, int(data.get("tabCount") or 0))
                 domain = extract_site_domain(url)
         except Exception:
@@ -618,7 +632,7 @@ let
             AVG(pkg_watts),
             AVG(disk_write_kibs)
           FROM samples
-          WHERE ts > ? AND ts <= ? AND afk = 0
+          WHERE ts > ? AND ts <= ? AND (afk = 0 OR browser_audible = 1)
           GROUP BY app
         """, (since, now_ts))
         for r in cur:
@@ -643,7 +657,7 @@ let
             AVG(gpu_render_pct + gpu_video_pct),
             AVG(pkg_watts)
           FROM samples
-          WHERE ts > ? AND ts <= ? AND afk = 0 AND LOWER(active_app) IN ("firefox", "navigator", "google-chrome", "chromium", "chrome", "brave")
+          WHERE ts > ? AND ts <= ? AND (afk = 0 OR browser_audible = 1) AND LOWER(active_app) IN ("firefox", "navigator", "google-chrome", "chromium", "chrome", "brave")
           GROUP BY site
         """, (since, now_ts))
         for r in cur:
@@ -652,6 +666,27 @@ let
                 "avg_gpu_pct": round(r[2] or 0.0, 1),
                 "avg_watts": round(r[3] or 0.0, 2),
             }
+
+        # Fallback hardware stats keyed by stripped window title (for multi-window tabs & hands-off video sessions)
+        title_stats = {}
+        cur.execute("""
+          SELECT
+            active_title,
+            AVG(cpu_busy_pct),
+            AVG(gpu_render_pct + gpu_video_pct),
+            AVG(pkg_watts)
+          FROM samples
+          WHERE ts > ? AND ts <= ? AND LENGTH(active_title) > 0 AND LOWER(active_app) IN ("firefox", "navigator", "google-chrome", "chromium", "chrome", "brave")
+          GROUP BY active_title
+        """, (since, now_ts))
+        for r in cur:
+            clean_t = strip_browser_suffix(r[0])
+            if clean_t and clean_t not in title_stats:
+                title_stats[clean_t] = {
+                    "avg_cpu_pct": round(r[1] or 0.0, 1),
+                    "avg_gpu_pct": round(r[2] or 0.0, 1),
+                    "avg_watts": round(r[3] or 0.0, 2),
+                }
 
         # Authoritative ActivityWatch clipping and interval intersection
         start_iso = datetime.fromtimestamp(since, timezone.utc).isoformat()
@@ -714,6 +749,16 @@ let
             activity_source = "activitywatch"
             total_tracked_seconds = aw_summary["total_tracked_seconds"]
             active_screen_seconds = aw_summary["active_screen_seconds"]
+            breakdown = {
+                "input_active_seconds": aw_summary.get("input_active_seconds", active_screen_seconds),
+                "media_active_seconds": aw_summary.get("media_active_seconds", 0.0),
+                "daytime_idle_seconds": aw_summary.get("daytime_idle_seconds", 0.0),
+                "overnight_sleep_seconds": aw_summary.get("overnight_sleep_seconds", 0.0),
+                "suspend_seconds": aw_summary.get("suspend_seconds", max(0.0, window_duration - total_tracked_seconds)),
+                "waking_seconds": aw_summary.get("waking_seconds", active_screen_seconds),
+                "waking_active_pct": aw_summary.get("waking_active_pct", 0.0),
+                "sleep_blocks": aw_summary.get("sleep_blocks", []),
+            }
 
             apps = []
             for a in aw_summary["apps"]:
@@ -731,7 +776,7 @@ let
 
             tabs = []
             for t in aw_summary["browser_tabs"]:
-                st = site_stats.get(t["site"], {})
+                st = site_stats.get(t["site"]) or title_stats.get(t.get("title", ""), {})
                 tabs.append({
                     "site": t["site"],
                     "title": t.get("title", ""),
@@ -754,6 +799,8 @@ let
 
             total_tracked_raw = 0.0
             active_screen_raw = 0.0
+            input_active_raw = 0.0
+            media_active_raw = 0.0
             app_durations = {}
             site_durations = {}
             site_audible_durs = {}
@@ -770,8 +817,13 @@ let
                 if effective_dt <= 0:
                     continue
                 total_tracked_raw += effective_dt
-                if ACTIVITY_ENABLED and r_afk == 0:
+                is_media_active = is_browser_app(r_app) and r_audible == 1
+                if ACTIVITY_ENABLED and (r_afk == 0 or is_media_active):
                     active_screen_raw += effective_dt
+                    if r_afk == 0:
+                        input_active_raw += effective_dt
+                    else:
+                        media_active_raw += effective_dt
                     app_name = r_app or "(unfocused/desktop)"
                     app_durations[app_name] = app_durations.get(app_name, 0.0) + effective_dt
 
@@ -784,6 +836,21 @@ let
 
             total_tracked_seconds = min(window_duration, total_tracked_raw)
             active_screen_seconds = min(total_tracked_seconds, active_screen_raw)
+            input_active_sec = min(active_screen_seconds, input_active_raw)
+            media_active_sec = max(0.0, active_screen_seconds - input_active_sec)
+            idle_total = max(0.0, total_tracked_seconds - active_screen_seconds)
+            suspend_sec = max(0.0, window_duration - total_tracked_seconds)
+            waking_sec = max(active_screen_seconds, window_duration - suspend_sec)
+            breakdown = {
+                "input_active_seconds": duration_seconds(input_active_sec),
+                "media_active_seconds": duration_seconds(media_active_sec),
+                "daytime_idle_seconds": duration_seconds(idle_total),
+                "overnight_sleep_seconds": 0.0,
+                "suspend_seconds": duration_seconds(suspend_sec),
+                "waking_seconds": duration_seconds(waking_sec),
+                "waking_active_pct": round((active_screen_seconds / waking_sec) * 100.0, 1) if waking_sec > 0 else 0.0,
+                "sleep_blocks": [],
+            }
 
             apps = []
             for app, sec in sorted(app_durations.items(), key=lambda x: x[1], reverse=True)[:20]:
@@ -805,7 +872,7 @@ let
             scale = (browser_focus_sec / sum_sites_raw) if sum_sites_raw > browser_focus_sec > 0 else 1.0
 
             for site, sec in sorted(site_durations.items(), key=lambda x: x[1], reverse=True)[:25]:
-                st = site_stats.get(site, {})
+                st = site_stats.get(site) or title_stats.get(site_titles.get(site, ""), {})
                 adj_sec = duration_seconds(sec * scale)
                 tabs.append({
                     "site": site,
@@ -826,7 +893,7 @@ let
         """, (since, now_ts))
         top_cpu_procs = [
             {"comm": r[0], "samples": r[1], "avg_pct": round(r[2] or 0, 1), "max_pct": round(r[3] or 0, 1)}
-            for r in cur.fetchall()
+          for r in cur.fetchall()
         ]
 
         cur.execute("""
@@ -853,6 +920,7 @@ let
             "sample_count": n,
             "total_tracked_seconds": total_tracked_seconds,
             "active_screen_seconds": active_screen_seconds,
+            "breakdown": breakdown,
             "latest": latest,
             "potential": {
                 "cpu_busy": {"avg": round(row[3] or 0, 1), "p95": round(p95("cpu_busy_pct"), 1), "max": round(row[4] or 0, 1)},
@@ -1284,7 +1352,7 @@ let
                 bat_health_pct = (efull / edesign * 100.0) if edesign > 0 else 100.0
 
             active_app, active_title, fb_domain, fb_tab = query_hyprland()
-            afk, aw_domain, aw_url, aw_tab_title, aw_audible, aw_tab_count = query_activitywatch(active_app)
+            afk, aw_domain, aw_url, aw_tab_title, aw_audible, aw_tab_count = query_activitywatch(active_app, active_title)
 
             is_browser = is_browser_app(active_app)
             browser_domain = (aw_domain if aw_domain else fb_domain) if is_browser else ""
@@ -1335,6 +1403,7 @@ let
   laptopReportBin = pkgs.writeScriptBin "laptop-report" ''
     #!${pkgs.python3}/bin/python3
     import argparse
+    from datetime import datetime
     import json
     import math
     import sys
@@ -1347,6 +1416,69 @@ let
         if s < 3600:
             return str(s // 60) + "m " + ("%02ds" % (s % 60))
         return str(s // 3600) + "h " + ("%02dm" % ((s % 3600) // 60))
+
+    def print_breakdown(data, hours):
+        w_sec = max(1.0, float(hours) * 3600.0)
+        tracked_sec = float(data.get("total_tracked_seconds") or 0.0)
+        active_sec = float(data.get("active_screen_seconds") or 0.0)
+        b = data.get("breakdown") or {}
+        input_sec = float(b.get("input_active_seconds", active_sec))
+        media_sec = float(b.get("media_active_seconds", max(0.0, active_sec - input_sec)))
+        pause_sec = float(b.get("daytime_idle_seconds", max(0.0, tracked_sec - active_sec)))
+        sleep_sec = float(b.get("overnight_sleep_seconds", 0.0))
+        susp_sec = float(b.get("suspend_seconds", max(0.0, w_sec - tracked_sec)))
+        waking_sec = float(b.get("waking_seconds", max(active_sec, w_sec - sleep_sec - susp_sec)))
+        waking_pct = float(b.get("waking_active_pct", (active_sec / waking_sec * 100.0) if waking_sec > 0 else 0.0))
+        blocks = b.get("sleep_blocks") or []
+
+        bar_w = 68
+        parts = [input_sec, media_sec, pause_sec, sleep_sec, susp_sec]
+        chars = ["█", "▓", "▒", "░", "·"]
+        counts = [int(round(p / w_sec * bar_w)) for p in parts]
+        for idx, p in enumerate(parts):
+            if p > 0 and counts[idx] == 0:
+                counts[idx] = 1
+        diff = bar_w - sum(counts)
+        if diff != 0:
+            largest = max(range(len(parts)), key=lambda i: parts[i])
+            counts[largest] = max(0, counts[largest] + diff)
+        bar = "".join(chars[i] * counts[i] for i in range(len(parts)))
+
+        sleep_detail = "Continuous idle blocks >= 3h"
+        if blocks:
+            formatted = []
+            for blk in sorted(blocks, key=lambda x: x.get("start", 0))[:2]:
+                try:
+                    st = datetime.fromtimestamp(float(blk["start"])).strftime("%a %H:%M")
+                    bsec = int(round(float(blk.get("seconds", 0))))
+                    bdur = "%dh%02dm" % (bsec // 3600, (bsec % 3600) // 60)
+                    formatted.append("%s (%s)" % (st, bdur))
+                except Exception:
+                    pass
+            if formatted:
+                sleep_detail = ", ".join(formatted)
+                if len(blocks) > 2:
+                    sleep_detail += " (+" + str(len(blocks) - 2) + ")"
+
+        print("-" * 78)
+        print(" WHERE THE %gh ACTUALLY WENT (Timeline & Presence Breakdown)" % hours)
+        print("  [%s]" % bar)
+        print("   █ Input  ▓ Media/Video  ▒ Reading/Breaks (<3h)  ░ Sleep (>=3h)  · Off/Sleep")
+        print("")
+        print("  Category                          Time     Share   What It Was")
+        print("  " + "-" * 74)
+        print("  █ Active Screen Time (Total)  %8s    %5.1f%%   %.1f%% of ~%s waking time" % (
+            fmt_dur(active_sec), active_sec / w_sec * 100.0, waking_pct, fmt_dur(waking_sec)))
+        print("    ├─ Active Typing & Trackpad %8s    %5.1f%%   Keyboard/mouse input (<3m idle)" % (
+            fmt_dur(input_sec), input_sec / w_sec * 100.0))
+        print("    └─ Hands-Off Media Playback %8s    %5.1f%%   Audible video/streams (>3m idle)" % (
+            fmt_dur(media_sec), media_sec / w_sec * 100.0))
+        print("  ▒ Daytime Pauses & Reading    %8s    %5.1f%%   Reading, thinking, meals (3m-3h)" % (
+            fmt_dur(pause_sec), pause_sec / w_sec * 100.0))
+        print("  ░ Overnight / Long Idle (>=3h)%8s    %5.1f%%   %s" % (
+            fmt_dur(sleep_sec), sleep_sec / w_sec * 100.0, sleep_detail[:36]))
+        print("  · Deep Suspend / Powered Off  %8s    %5.1f%%   Lid closed / system suspended" % (
+            fmt_dur(susp_sec), susp_sec / w_sec * 100.0))
 
     def main():
         ap = argparse.ArgumentParser(description="Laptop Hardware Potential & Screen Time Report")
@@ -1384,6 +1516,7 @@ let
         else:
             print(" Power profile: %s (EPP=%s, AC=%s)  |  Battery health: %s%%" % (
                 L.get("power_profile", "?"), L.get("epp", "?"), L.get("ac_online", 0), P["battery_health_pct"]))
+            print_breakdown(data, args.hours)
             print("-" * 78)
             print(" HARDWARE POTENTIAL UTILIZATION (System capacity & workload ceilings)")
             print("  CPU Frequency-Weighted Busy (estimate): cur %5.1f%% | avg %5.1f%% | p95 %5.1f%% | peak %5.1f%%" % (
@@ -1421,11 +1554,15 @@ let
         if not data["browser_tabs"]:
             print("  (No active browser focus recorded in window yet)")
         for t in data["browser_tabs"][:12]:
+            site_label = t["site"]
+            aud_s = float(t.get("audible_seconds") or 0.0)
+            if aud_s >= 30.0:
+                site_label = "%s [audio %s]" % (site_label[:26], fmt_dur(aud_s))
             if not t.get("hardware_available", True):
-                print("  %-42s  %8s  | Hardware unavailable" % (t["site"][:42], fmt_dur(t["seconds"])))
+                print("  %-42s  %8s  | Hardware unavailable" % (site_label[:42], fmt_dur(t["seconds"])))
                 continue
             print("  %-42s  %8s  | CPU %4.1f%% | GPU %4.1f%% | %4.1f W" % (
-                t["site"][:42], fmt_dur(t["seconds"]), t["avg_cpu_pct"], t["avg_gpu_pct"], t["avg_watts"]))
+                site_label[:42], fmt_dur(t["seconds"]), t["avg_cpu_pct"], t["avg_gpu_pct"], t["avg_watts"]))
         print("-" * 78)
         print(" Dashboards: http://127.0.0.1:5601 (Hardware Potential + Screen Time) | http://127.0.0.1:5600 (ActivityWatch)")
         print("=" * 78)

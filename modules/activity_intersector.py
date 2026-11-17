@@ -159,6 +159,148 @@ def intersect_intervals(ivs_a, ivs_b):
     return res
 
 
+def subtract_intervals(base_ivs, sub_ivs):
+    """
+    Subtract sorted disjoint intervals `sub_ivs` from sorted disjoint intervals `base_ivs`.
+    Returns a list of (start, end, data) intervals remaining in `base_ivs`.
+    """
+    if not base_ivs:
+        return []
+    if not sub_ivs:
+        return [(b[0], b[1], b[2] if len(b) > 2 else {}) for b in base_ivs if b[0] < b[1]]
+
+    res = []
+    j = 0
+    n_sub = len(sub_ivs)
+    for b in base_ivs:
+        bs, be = b[0], b[1]
+        bdata = b[2] if len(b) > 2 else {}
+        if bs >= be:
+            continue
+        cur = bs
+        while j < n_sub and sub_ivs[j][1] <= cur:
+            j += 1
+        k = j
+        while k < n_sub and sub_ivs[k][0] < be:
+            ss, se = sub_ivs[k][0], sub_ivs[k][1]
+            if ss > cur:
+                res.append((cur, min(be, ss), bdata))
+            cur = max(cur, se)
+            if cur >= be:
+                break
+            k += 1
+        if cur < be:
+            res.append((cur, be, bdata))
+    return res
+
+
+BROWSER_TITLE_SUFFIXES = (
+    " — Mozilla Firefox",
+    " - Mozilla Firefox",
+    " — Firefox",
+    " - Firefox",
+    " - Google Chrome",
+    " — Google Chrome",
+    " - Chromium",
+    " — Chromium",
+    " - Brave",
+    " — Brave",
+    " - Vivaldi",
+    " — Vivaldi",
+    " - Microsoft Edge",
+    " — Microsoft Edge",
+)
+
+
+def strip_browser_suffix(title):
+    """Strip standard browser window title suffixes to recover the active tab title."""
+    if not isinstance(title, str):
+        return ""
+    t = title.strip()
+    for suffix in BROWSER_TITLE_SUFFIXES:
+        if t.endswith(suffix):
+            return t[:-len(suffix)].strip()
+    return t
+
+
+def reconstruct_browser_web_intervals(raw_web, b_win_ivs, window_start, window_end, pulse_lease=65.0):
+    """
+    Reconstruct active browser tab intervals aligned to focused browser windows.
+    Handles both standard duration>0 web events AND multi-window duration=0 heartbeats
+    (where 2+ open browser windows interleave 60s heartbeats in the same bucket).
+    """
+    if not raw_web or not b_win_ivs:
+        return []
+
+    standard_disjoint = make_disjoint(clip_events(raw_web, window_start, window_end))
+
+    # Parse all valid raw web heartbeats (including duration=0) to recover multi-window streams
+    parsed_raw = []
+    for ev in raw_web:
+        try:
+            if isinstance(ev, (list, tuple)):
+                s = float(ev[0])
+                e = float(ev[1])
+                data = ev[2] if len(ev) > 2 else {}
+            else:
+                ts = ev.get("timestamp") if "timestamp" in ev else ev.get("start")
+                if ts is None:
+                    continue
+                s = parse_iso(ts)
+                dur = float(ev.get("duration", 0.0) or 0.0)
+                if dur < 0:
+                    continue
+                e = float(ev["end"]) if "end" in ev else s + dur
+                data = ev.get("data", {})
+            if not math.isfinite(s) or not math.isfinite(e) or e < s:
+                continue
+            if not isinstance(data, dict):
+                data = {}
+            parsed_raw.append((s, e, data))
+        except (TypeError, ValueError, IndexError, AttributeError, OverflowError):
+            continue
+
+    parsed_raw.sort(key=lambda x: x[0])
+
+    by_title = {}
+    for s, e, d in parsed_raw:
+        t = str(d.get("title") or "").strip()
+        if t:
+            by_title.setdefault(t, []).append((s, e, d))
+
+    extended_by_title = {}
+    for t, evs in by_title.items():
+        leased = []
+        for idx, (s, e, d) in enumerate(evs):
+            next_s = evs[idx + 1][0] if idx + 1 < len(evs) else (s + pulse_lease)
+            lease_e = max(e, min(next_s, s + pulse_lease))
+            s_c = max(s, window_start)
+            e_c = min(lease_e, window_end)
+            if s_c < e_c:
+                leased.append((s, s_c, e_c, d))
+        leased.sort(key=lambda x: x[0])
+        extended_by_title[t] = make_disjoint([(s_c, e_c, d) for _, s_c, e_c, d in leased])
+
+    resolved = []
+    for ws, we, wd in b_win_ivs:
+        wtitle = strip_browser_suffix(wd.get("title", "")) if isinstance(wd, dict) else ""
+        if wtitle and wtitle in extended_by_title and extended_by_title[wtitle]:
+            matched = [
+                (s, e, web_d)
+                for s, e, _, web_d in intersect_intervals([(ws, we, wd)], extended_by_title[wtitle])
+            ]
+            resolved.extend(matched)
+            remaining = subtract_intervals([(ws, we, wd)], [(s, e, {}) for s, e, _ in matched])
+            if remaining and standard_disjoint:
+                for s, e, web_d, _ in intersect_intervals(standard_disjoint, remaining):
+                    resolved.append((s, e, web_d))
+        elif standard_disjoint:
+            for s, e, web_d, _ in intersect_intervals(standard_disjoint, [(ws, we, wd)]):
+                resolved.append((s, e, web_d))
+
+    return make_disjoint(resolved)
+
+
 def extract_site_domain(url, title=""):
     """Extract clean domain/site name from URL or title."""
     fallback = title if isinstance(title, str) and title else "(browser)"
@@ -198,6 +340,14 @@ def compute_screen_time_summary(
     - window_seconds
     - total_tracked_seconds
     - active_screen_seconds
+    - input_active_seconds
+    - media_active_seconds
+    - daytime_idle_seconds
+    - overnight_sleep_seconds
+    - suspend_seconds
+    - waking_seconds
+    - waking_active_pct
+    - sleep_blocks: list of {"start": float, "end": float, "seconds": float}
     - apps: list of {"app": str, "seconds": float}
     - browser_focus: dict of {browser_key: seconds}
     - browser_tabs: list of {"site": str, "browser": str, "seconds": float, "audible_seconds": float}
@@ -221,31 +371,98 @@ def compute_screen_time_summary(
         sum(e - s for s, e in tracked_ivs),
     )
 
-    # Active time: union of 'not-afk' events
+    # Input-active time: union of 'not-afk' events
     not_afk_raw = [(s, e, d) for s, e, d in clipped_afk if d.get("status") == "not-afk"]
-    active_ivs = merge_intervals(not_afk_raw)
-    active_screen_seconds = min(
-        total_tracked_seconds,
-        sum(e - s for s, e in active_ivs),
-    )
-
-    # An open window proves coverage, not that its user was present. Let the
-    # caller fall back to sampled AFK evidence instead of inventing active time.
-    if not active_measurement_available and window_events:
-        clipped_win_fallback = clip_events(window_events, window_start, window_end)
-        disjoint_win_fallback = make_disjoint(clipped_win_fallback)
-        total_tracked_seconds = min(
-            window_duration,
-            sum(e - s for s, e, _ in disjoint_win_fallback),
-        )
-        active_screen_seconds = 0.0
-        active_ivs = []
+    input_active_ivs = merge_intervals(not_afk_raw)
 
     # 2. Window events clipped and made disjoint
     clipped_window = clip_events(window_events, window_start, window_end)
     disjoint_window = make_disjoint(clipped_window)
 
-    # Intersect window events with active (not-afk) intervals
+    # Pre-resolve browser web intervals against focused browser windows so we can:
+    # (a) recover multi-window duration=0 heartbeats via window title matching, and
+    # (b) exempt focused audible media playback (e.g. >3m YouTube videos) from the AFK cutoff.
+    resolved_web_by_browser = {}
+    audible_focused_ivs = []
+    for b_key, b_apps in BROWSER_FAMILIES.items():
+        b_win_ivs = [
+            (s, e, da)
+            for s, e, da in disjoint_window
+            if isinstance(da.get("app"), str) and da["app"].strip().lower() in b_apps
+        ]
+        raw_web = web_events_by_browser.get(b_key, [])
+        if not raw_web:
+            raw_web = web_events_by_browser.get("web", [])
+        if raw_web and b_win_ivs:
+            resolved_web = reconstruct_browser_web_intervals(
+                raw_web, b_win_ivs, window_start, window_end
+            )
+            resolved_web_by_browser[b_key] = resolved_web
+            for s, e, dw in resolved_web:
+                if dw.get("audible"):
+                    audible_focused_ivs.append((s, e, {}))
+        else:
+            resolved_web_by_browser[b_key] = []
+
+    if active_measurement_available:
+        audible_in_tracked = [
+            (s, e, {})
+            for s, e, _, _ in intersect_intervals(
+                make_disjoint(audible_focused_ivs),
+                [(ts, te, {}) for ts, te in tracked_ivs],
+            )
+        ]
+        active_ivs = merge_intervals(
+            [(s, e, {}) for s, e in input_active_ivs] + audible_in_tracked
+        )
+        input_active_seconds = min(
+            total_tracked_seconds,
+            sum(e - s for s, e in input_active_ivs),
+        )
+        active_screen_seconds = min(
+            total_tracked_seconds,
+            sum(e - s for s, e in active_ivs),
+        )
+        media_active_seconds = max(0.0, active_screen_seconds - input_active_seconds)
+    else:
+        # An open window proves coverage, not that its user was present. Let the
+        # caller fall back to sampled AFK evidence instead of inventing active time.
+        if window_events:
+            total_tracked_seconds = min(
+                window_duration,
+                sum(e - s for s, e, _ in disjoint_window),
+            )
+        input_active_seconds = 0.0
+        media_active_seconds = 0.0
+        active_screen_seconds = 0.0
+        active_ivs = []
+
+    # Compute idle/sleep/suspend presence breakdown across the lookback window
+    effective_idle_ivs = subtract_intervals(
+        [(s, e, {}) for s, e in tracked_ivs],
+        [(s, e, {}) for s, e in active_ivs],
+    )
+    sleep_threshold = 3.0 * 3600.0
+    sleep_blocks = []
+    overnight_sleep_raw = 0.0
+    daytime_idle_raw = 0.0
+    for s, e, _ in effective_idle_ivs:
+        dur = e - s
+        if dur >= sleep_threshold:
+            overnight_sleep_raw += dur
+            sleep_blocks.append({
+                "start": s,
+                "end": e,
+                "seconds": duration_seconds(dur),
+            })
+        else:
+            daytime_idle_raw += dur
+
+    suspend_raw = max(0.0, window_duration - total_tracked_seconds)
+    waking_raw = max(active_screen_seconds, window_duration - overnight_sleep_raw - suspend_raw)
+    waking_active_pct = round((active_screen_seconds / waking_raw) * 100.0, 1) if waking_raw > 0 else 0.0
+
+    # Intersect window events with active (input + audible media) intervals
     active_window_ivs = intersect_intervals(disjoint_window, [(s, e, {}) for s, e in active_ivs])
 
     # Aggregate by app
@@ -277,18 +494,10 @@ def compute_screen_time_summary(
         b_focus_sec = sum(e - s for s, e, _ in b_active_ivs)
         browser_focus[b_key] = b_focus_sec
 
-        # Get web events for this browser
-        raw_web = web_events_by_browser.get(b_key, [])
-        if not raw_web:
-            # Check generic key 'web' or 'all'
-            raw_web = web_events_by_browser.get("web", [])
-
-        if raw_web and b_active_ivs:
-            clipped_web = clip_events(raw_web, window_start, window_end)
-            disjoint_web = make_disjoint(clipped_web)
-
-            # Intersect web events with focused active browser window intervals
-            site_active = intersect_intervals(disjoint_web, b_active_ivs)
+        resolved_web = resolved_web_by_browser.get(b_key, [])
+        if resolved_web and b_active_ivs:
+            # Intersect resolved web events with focused active browser window intervals
+            site_active = intersect_intervals(resolved_web, b_active_ivs)
 
             site_dur = {}
             site_audible = {}
@@ -301,7 +510,8 @@ def compute_screen_time_summary(
                 site = extract_site_domain(url, title)
 
                 site_dur[site] = site_dur.get(site, 0.0) + dur
-                site_title[site] = title
+                if title and (site not in site_title or not site_title[site]):
+                    site_title[site] = title
                 if dw.get("audible"):
                     site_audible[site] = site_audible.get(site, 0.0) + dur
 
@@ -331,6 +541,14 @@ def compute_screen_time_summary(
         "window_seconds": window_duration,
         "total_tracked_seconds": duration_seconds(total_tracked_seconds),
         "active_screen_seconds": duration_seconds(active_screen_seconds),
+        "input_active_seconds": duration_seconds(input_active_seconds),
+        "media_active_seconds": duration_seconds(media_active_seconds),
+        "daytime_idle_seconds": duration_seconds(daytime_idle_raw),
+        "overnight_sleep_seconds": duration_seconds(overnight_sleep_raw),
+        "suspend_seconds": duration_seconds(suspend_raw),
+        "waking_seconds": duration_seconds(waking_raw),
+        "waking_active_pct": waking_active_pct,
+        "sleep_blocks": sleep_blocks,
         "active_measurement_available": active_measurement_available,
         "apps": apps_list,
         "browser_focus": {k: duration_seconds(v) for k, v in browser_focus.items()},
