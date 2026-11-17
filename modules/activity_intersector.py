@@ -318,6 +318,17 @@ def extract_site_domain(url, title=""):
     return fallback
 
 
+def is_youtube_site(site):
+    """Return True if the extracted site domain is YouTube."""
+    if not isinstance(site, str):
+        return False
+    s = site.strip().lower()
+    return (
+        s in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")
+        or s.endswith(".youtube.com")
+    )
+
+
 def compute_screen_time_summary(
     afk_events,
     window_events,
@@ -399,7 +410,11 @@ def compute_screen_time_summary(
             )
             resolved_web_by_browser[b_key] = resolved_web
             for s, e, dw in resolved_web:
-                if dw.get("audible"):
+                site = extract_site_domain(
+                    dw.get("url") or "",
+                    dw.get("title") if isinstance(dw.get("title"), str) else "",
+                )
+                if dw.get("audible") and is_youtube_site(site):
                     audible_focused_ivs.append((s, e, {}))
         else:
             resolved_web_by_browser[b_key] = []
