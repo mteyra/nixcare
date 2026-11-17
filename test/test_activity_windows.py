@@ -129,17 +129,17 @@ class ActivityWindowsTests(unittest.TestCase):
         self.assertEqual(summary["browser_tabs"][0]["seconds"], 1200)
         self.assertEqual(summary["browser_tabs"][0]["audible_seconds"], 1200)
 
-    def test_non_youtube_audible_site_does_not_bypass_afk_cutoff(self):
+    def test_audio_only_music_site_does_not_bypass_afk_cutoff(self):
         afk_events = [
             event(0, 180, status="not-afk"),
             event(180, 1200, status="afk"),
         ]
         win_events = [
-            event(0, 1200, app="firefox", title="Watch Show — Mozilla Firefox"),
+            event(0, 1200, app="firefox", title="Playlist — Mozilla Firefox"),
         ]
         web_events = {
             "firefox": [
-                event(0, 1200, url="https://hdtodayz.org/watch", title="Watch Show", audible=True),
+                event(0, 1200, url="https://open.spotify.com/playlist/123", title="Playlist", audible=True),
             ]
         }
         summary = ai.compute_screen_time_summary(afk_events, win_events, web_events, 0, 1200)
@@ -147,7 +147,7 @@ class ActivityWindowsTests(unittest.TestCase):
         self.assertEqual(summary["input_active_seconds"], 180)
         self.assertEqual(summary["media_active_seconds"], 0)
         self.assertEqual(summary["active_screen_seconds"], 180)
-        self.assertEqual(summary["browser_tabs"][0]["site"], "hdtodayz.org")
+        self.assertEqual(summary["browser_tabs"][0]["site"], "open.spotify.com")
         self.assertEqual(summary["browser_tabs"][0]["seconds"], 180)
 
     def test_multi_window_zero_duration_heartbeats_recover_focused_tab_and_ignore_background_window(self):

@@ -537,7 +537,7 @@ let
                 audible = 1 if data.get("audible") else 0
                 tab_count = max(0, int(data.get("tabCount") or 0))
                 domain = extract_site_domain(url)
-                if audible == 1 and is_youtube_site(domain):
+                if audible == 1 and is_video_site(domain):
                     afk = 0
         except Exception:
             pass
@@ -817,7 +817,7 @@ let
                 if effective_dt <= 0:
                     continue
                 total_tracked_raw += effective_dt
-                is_media_active = is_browser_app(r_app) and r_audible == 1 and is_youtube_site(r_domain)
+                is_media_active = is_browser_app(r_app) and r_audible == 1 and is_video_site(r_domain or r_title)
                 if ACTIVITY_ENABLED and (r_afk == 0 or is_media_active):
                     active_screen_raw += effective_dt
                     if r_afk == 0:
@@ -1463,7 +1463,7 @@ let
         print("-" * 78)
         print(" WHERE THE %gh ACTUALLY WENT (Timeline & Presence Breakdown)" % hours)
         print("  [%s]" % bar)
-        print("   █ Input  ▓ YouTube  ▒ Reading/Breaks (<3h)  ░ Sleep (>=3h)  · Off/Sleep")
+        print("   █ Input  ▓ Video  ▒ Reading/Breaks (<3h)  ░ Sleep (>=3h)  · Off/Sleep")
         print("")
         print("  Category                          Time     Share   What It Was")
         print("  " + "-" * 74)
@@ -1471,7 +1471,7 @@ let
             fmt_dur(active_sec), active_sec / w_sec * 100.0, waking_pct, fmt_dur(waking_sec)))
         print("    ├─ Active Typing & Trackpad %8s    %5.1f%%   Keyboard/mouse input (<3m idle)" % (
             fmt_dur(input_sec), input_sec / w_sec * 100.0))
-        print("    └─ Hands-Off YouTube Video  %8s    %5.1f%%   Audible YouTube video (>3m idle)" % (
+        print("    └─ Hands-Off Video Playback %8s    %5.1f%%   Audible video playback (>3m idle)" % (
             fmt_dur(media_sec), media_sec / w_sec * 100.0))
         print("  ▒ Daytime Pauses & Reading    %8s    %5.1f%%   Reading, thinking, meals (3m-3h)" % (
             fmt_dur(pause_sec), pause_sec / w_sec * 100.0))

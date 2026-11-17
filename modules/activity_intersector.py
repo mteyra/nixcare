@@ -318,15 +318,30 @@ def extract_site_domain(url, title=""):
     return fallback
 
 
-def is_youtube_site(site):
-    """Return True if the extracted site domain is YouTube."""
+AUDIO_ONLY_DOMAINS = {
+    "open.spotify.com",
+    "music.youtube.com",
+    "soundcloud.com",
+    "www.soundcloud.com",
+    "tidal.com",
+    "listen.tidal.com",
+    "deezer.com",
+    "www.deezer.com",
+    "music.apple.com",
+}
+
+
+def is_video_site(site):
+    """
+    Return True if an audible focused browser tab on `site` represents video playback
+    (i.e. any site other than dedicated audio-only music players).
+    """
     if not isinstance(site, str):
         return False
     s = site.strip().lower()
-    return (
-        s in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")
-        or s.endswith(".youtube.com")
-    )
+    if not s:
+        return False
+    return s not in AUDIO_ONLY_DOMAINS
 
 
 def compute_screen_time_summary(
@@ -414,7 +429,7 @@ def compute_screen_time_summary(
                     dw.get("url") or "",
                     dw.get("title") if isinstance(dw.get("title"), str) else "",
                 )
-                if dw.get("audible") and is_youtube_site(site):
+                if dw.get("audible") and is_video_site(site):
                     audible_focused_ivs.append((s, e, {}))
         else:
             resolved_web_by_browser[b_key] = []
