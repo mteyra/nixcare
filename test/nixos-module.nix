@@ -28,6 +28,8 @@ let
   disabled = configuration false {};
   fast = configuration false { services.nixcare.scan.vulnerabilities = false; };
   unguarded = configuration false { services.nixcare.deferUnderLoad = false; };
+  noActivity = configuration false { services.nixcare.track.activity.enable = lib.mkForce false; };
+  collectorExec = config: config.systemd.services.laptop-telemetry.serviceConfig.ExecStart;
   extension = "nglaklhklhcoonedhgnpgddginnjdadi;https://clients2.google.com/service/update2/crx";
   policies = path:
     builtins.fromJSON enabled.environment.etc.${path}.text;
@@ -57,6 +59,11 @@ assert !(fast.systemd.services.nixcare-scan.serviceConfig ? RestartForceExitStat
 assert lib.hasSuffix "scan --fast" fast.systemd.services.nixcare-scan.serviceConfig.ExecStart;
 assert !(unguarded.systemd.services.nixcare-scan.serviceConfig ? RestartForceExitStatus);
 assert retriesOnlyDeferredWork unguarded.systemd.services.nixcare-update;
+assert lib.hasInfix "/laptop_telemetry.py " (collectorExec enabled);
+assert lib.hasInfix "--retention-days" (collectorExec enabled);
+assert lib.hasInfix "/bin/nvme" (collectorExec enabled);
+assert lib.hasSuffix "--activity" (collectorExec enabled);
+assert !(lib.hasInfix "--activity" (collectorExec noActivity));
 {
   browserExtensionPoliciesWorkWhenEnabled = true;
   browserExtensionPoliciesStayOptIn = true;
@@ -66,4 +73,5 @@ assert retriesOnlyDeferredWork unguarded.systemd.services.nixcare-update;
   ordinaryFailuresAndInputChecksDoNotRetry = true;
   inputCheckKeepsSpecialCharactersInPathsLiteral = true;
   fastScansAndResourceOptOutSkipLoadDeferrals = true;
+  collectorGetsItsSettingsFromTheCommandLine = true;
 }
