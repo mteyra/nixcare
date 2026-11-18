@@ -1,16 +1,15 @@
 """Regression tests for telemetry's browser boundary and interval accounting."""
 
 import http.client
+import importlib.util
 import builtins
 import contextlib
 import io
 import json
 from pathlib import Path
-import re
 import sqlite3
 import sys
 import tempfile
-import textwrap
 import threading
 import time
 import unittest
@@ -22,28 +21,23 @@ import activity_intersector as ai
 from tracking_support import SummaryCache, local_request_allowed, validate_hours, read_json_bounded, sample_duration, select_activity_buckets
 
 
+def load_fresh(filename, name):
+    """Load a module from modules/ as a new, independent copy for each test."""
+    spec = importlib.util.spec_from_file_location(name, MODULES / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def collector_namespace():
-    """Test the actual embedded collector, substituting only Nix constants."""
-    source = (MODULES / "track.nix").read_text()
-    source = source.split('collectorPy = pkgs.writeText "laptop-telemetry-daemon.py" \'\'\n', 1)[1]
-    source = textwrap.dedent(source.split("\n  '';", 1)[0])
-    source = source.replace("${intersectorCode}", (MODULES / "activity_intersector.py").read_text())
-    source = source.replace("${trackingSupportCode}", (MODULES / "tracking_support.py").read_text())
-    source = re.sub(r"\$\{[^}]+\}", "0", source)
-    namespace = {"__name__": "telemetry_test"}
-    exec(compile(source, "track.nix:collector", "exec"), namespace)
-    namespace["RETENTION_DAYS"] = 90
-    return namespace
+    """The collector's globals, with the default settings the NixOS module uses."""
+    module = load_fresh("laptop_telemetry.py", "telemetry_test")
+    module.apply_settings(module.parse_args(["--user", "testuser", "--retention-days", "90"]))
+    return vars(module)
 
 
 def report_namespace():
-    source = (MODULES / "track.nix").read_text().split('laptopReportBin = pkgs.writeScriptBin "laptop-report" \'\'\n', 1)[1]
-    source = textwrap.dedent(source.split("\n  '';", 1)[0])
-    source = source.replace("${toString cfg.track.retentionDays}", "90")
-    source = re.sub(r"\$\{[^}]+\}", "0", source)
-    namespace = {"__name__": "report_test"}
-    exec(compile(source, "track.nix:report", "exec"), namespace)
-    return namespace
+    return vars(load_fresh("laptop_report.py", "report_test"))
 
 
 class TrackingBoundaryTests(unittest.TestCase):
@@ -366,6 +360,41 @@ class TrackingWindowTests(unittest.TestCase):
                     ns["main"]()
         self.assertIn("No hardware samples in this window", output.getvalue())
         self.assertNotIn("CPU Thread Busy", output.getvalue())
+
+
+class CommandLineSettingsTests(unittest.TestCase):
+    """The NixOS module configures the collector and report only through these options."""
+
+    def test_settings_reach_the_collector(self):
+        module = load_fresh("laptop_telemetry.py", "telemetry_settings_test")
+        module.apply_settings(module.parse_args(
+            ["--user", "alice", "--retention-days", "30", "--activity", "--nvme", "/x/bin/nvme"]))
+        self.assertEqual(
+            (module.OWNER_USER, module.RETENTION_DAYS, module.ACTIVITY_ENABLED, module.NVME_BIN),
+            ("alice", 30, True, "/x/bin/nvme"))
+
+    def test_activity_stays_off_unless_requested(self):
+        module = load_fresh("laptop_telemetry.py", "telemetry_settings_test")
+        module.apply_settings(module.parse_args(["--user", "alice"]))
+        self.assertFalse(module.ACTIVITY_ENABLED)
+        self.assertEqual(module.RETENTION_DAYS, 90)
+
+    def test_collector_requires_user_and_positive_retention(self):
+        module = load_fresh("laptop_telemetry.py", "telemetry_settings_test")
+        for argv in ([], ["--user", "alice", "--retention-days", "0"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    module.parse_args(argv)
+
+    def test_report_hours_limit_follows_retention(self):
+        ns = report_namespace()
+        argv = ["laptop-report", "--retention-days", "1", "--hours", "25"]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(ns["urllib"].request, "urlopen") as network:
+                with self.assertRaises(SystemExit) as exited:
+                    ns["main"]()
+                network.assert_not_called()
+        self.assertEqual(exited.exception.code, 2)
 
 
 class TelemetryHTTPTests(unittest.TestCase):

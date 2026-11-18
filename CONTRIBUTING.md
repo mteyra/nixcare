@@ -36,7 +36,9 @@ These require a writable Nix store and are skipped in the default sandboxed unit
 | `modules/default.nix` | NixOS options, CLI wrapper, maintenance services and timers |
 | `modules/nixcare_core.py` | System scans, retention planning, verified candidate build/apply, saved results |
 | `modules/home-manager.nix` | User-level Linux/macOS schedules |
-| `modules/track.nix` | Optional collector, dashboard, and desktop integration |
+| `modules/track.nix` | Optional tracking: services, ActivityWatch, browser policies, and the settings passed to the collector |
+| `modules/laptop_telemetry.py` | The collector: samples hardware and activity into a private SQLite database and serves the local dashboard |
+| `modules/laptop_report.py` | `laptop-report`, the terminal summary of the dashboard data |
 | `modules/activity_intersector.py` | Clipped, non-overlapping screen-time accounting |
 | `modules/tracking_support.py` | Local HTTP request boundaries and bounded summary caching |
 | `modules/schedule_guard.py` | Small Linux resource checks before scheduled heavy work |
