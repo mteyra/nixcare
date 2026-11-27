@@ -34,6 +34,7 @@ let
   collectorArgs = [
     "--user" cfg.user
     "--retention-days" (toString cfg.track.retentionDays)
+    "--site-labels" (builtins.toJSON cfg.track.siteLabels)
     "--nvme" "${pkgs.nvme-cli}/bin/nvme"
   ] ++ lib.optional cfg.track.activity.enable "--activity";
 

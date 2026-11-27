@@ -191,6 +191,12 @@ in
       enable = lib.mkOption { type = lib.types.bool; default = false; description = "Opt in to a local hardware telemetry database and dashboard."; };
       activity.enable = lib.mkOption { type = lib.types.bool; default = false; description = "Opt in to ActivityWatch window and screen-time collection (supported desktop required)."; };
       browserExtensions.enable = lib.mkOption { type = lib.types.bool; default = false; description = "Opt in to installing browser ActivityWatch extensions for browser-tab tracking."; };
+      siteLabels = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { "claude.ai" = "claude.ai"; "youtube.com" = "YouTube"; "github.com" = "GitHub"; "studon.fau.de" = "StudOn"; };
+        example = { "youtube.com" = "YouTube"; };
+        description = "Sites (domain, subdomains included) that get their own screen-time label; every other site counts as its browser.";
+      };
       retentionDays = lib.mkOption { type = lib.types.ints.positive; default = 90; description = "Days of optional telemetry retained locally."; };
     };
     agentBridge.mode = lib.mkOption {

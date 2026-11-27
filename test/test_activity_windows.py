@@ -181,5 +181,54 @@ class ActivityWindowsTests(unittest.TestCase):
         self.assertEqual(summary["browser_tabs"][0]["audible_seconds"], 300)
 
 
+    def test_labels_split_listed_sites_and_terminals_without_double_counting(self):
+        afk = [event(0, 400, status="not-afk")]
+        windows = [
+            event(0, 100, app="firefox", title="x"),
+            event(100, 200, app="kitty", title="Laptop-widget MP8 screen time"),
+            event(200, 260, app="kitty", title="git status /e/nixos"),
+            event(260, 300, app="kitty", title="ubuntu@fau: ~"),
+            event(300, 400, app="Logseq", title="journal"),
+        ]
+        web = {"firefox": [
+            event(0, 40, url="https://www.youtube.com/watch?v=1", title="v"),
+            event(40, 70, url="https://claude.ai/chat/1", title="c"),
+            event(70, 100, url="https://news.example.org/a", title="n"),
+        ]}
+        summary = ai.compute_screen_time_summary(afk, windows, web, 0, 400)
+        labels = {x["label"]: x["seconds"] for x in summary["labels"]}
+        self.assertEqual(labels, {
+            "YouTube": 40, "claude.ai": 30, "firefox": 30,
+            "Claude Code": 100, "kitty-shell": 100, "Logseq": 100,
+        })
+        self.assertEqual(sum(labels.values()), summary["active_screen_seconds"])
+        self.assertNotIn("news.example.org", labels)
+
+    def test_custom_site_labels_replace_the_defaults(self):
+        afk = [event(0, 100, status="not-afk")]
+        windows = [event(0, 100, app="firefox", title="x")]
+        web = {"firefox": [event(0, 100, url="https://www.studon.fau.de/x", title="s")]}
+        summary = ai.compute_screen_time_summary(afk, windows, web, 0, 100, site_labels={"youtube.com": "YouTube"})
+        self.assertEqual(summary["labels"], [{"label": "firefox", "seconds": 100}])
+
+    def test_terminal_titles(self):
+        for title, label in [
+            ("Claude Code", "Claude Code"), ("claude ~", "Claude Code"),
+            ("Brain v0 Agentic Secretary build", "Claude Code"),
+            ("~", "kitty-shell"), ("fau ~", "kitty-shell"), ("", "kitty-shell"),
+            ("health-sync --since /e/nixos", "kitty-shell"), ("og77emaw@cip1e0: ~", "kitty-shell"),
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(ai.window_label("kitty", title), label)
+        self.assertEqual(ai.window_label("firefox", "anything"), "firefox")
+
+    def test_hourly_splits_active_time_at_clock_hours(self):
+        import time as _t
+        base = _t.mktime((2026, 11, 27, 10, 50, 0, 0, 0, -1))
+        afk = [event(base, base + 1200, status="not-afk")]
+        summary = ai.compute_screen_time_summary(afk, [event(base, base + 1200, app="kitty", title="~")], {}, base, base + 1200)
+        self.assertEqual([h["seconds"] for h in summary["hourly"]], [600, 600])
+        self.assertEqual(_t.localtime(summary["hourly"][1]["start"]).tm_hour, 11)
+
 if __name__ == "__main__":
     unittest.main()

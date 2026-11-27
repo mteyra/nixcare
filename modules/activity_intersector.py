@@ -9,6 +9,8 @@ Guarantees 3 core invariants:
 """
 
 import math
+import re
+import time
 import urllib.parse
 from datetime import datetime
 
@@ -344,12 +346,69 @@ def is_video_site(site):
     return s not in AUDIO_ONLY_DOMAINS
 
 
+# Screen-time labels: one flat list where every second of active time has
+# exactly one label. Only the sites listed here get their own label (the
+# fixed list); every other site stays inside the browser's app name.
+DEFAULT_SITE_LABELS = {
+    "claude.ai": "claude.ai",
+    "youtube.com": "YouTube",
+    "github.com": "GitHub",
+    "studon.fau.de": "StudOn",
+}
+
+# Terminals split into "Claude Code" and "<app>-shell". Shell titles (fish)
+# end in the working directory ("~", "/e/nixos", "user@host: ~"); Claude Code
+# replaces the title with "Claude Code" or its session name.
+TERMINAL_APPS = {"kitty"}
+_SHELL_TITLE = re.compile(r"(^|\s)[~/]\S*$|^\S+@\S+:")
+
+
+def site_label(site, site_labels):
+    """Label for a listed site or any of its subdomains, else None."""
+    host = site.strip().lower().rstrip(".") if isinstance(site, str) else ""
+    while host:
+        if host in site_labels:
+            return site_labels[host]
+        if "." not in host:
+            return None
+        host = host.split(".", 1)[1]
+    return None
+
+
+def window_label(app, title):
+    """Label for a focused window: the app name, or Claude Code / <terminal>-shell."""
+    if app.strip().lower() in TERMINAL_APPS:
+        t = title.strip() if isinstance(title, str) else ""
+        if t == "Claude Code" or t.startswith("claude ") or (t and not _SHELL_TITLE.search(t)):
+            return "Claude Code"
+        return app + "-shell"
+    return app
+
+
+def hourly_seconds(intervals):
+    """Split (start, end) intervals at local clock hours: [{"start", "seconds"}]."""
+    buckets = {}
+    for s, e in intervals:
+        t = s
+        while t < e:
+            offset = time.localtime(t).tm_gmtoff
+            hour_start = t - ((t + offset) % 3600)
+            seg_end = min(e, hour_start + 3600)
+            buckets[hour_start] = buckets.get(hour_start, 0.0) + (seg_end - t)
+            t = seg_end
+    return [
+        {"start": int(round(h)), "seconds": duration_seconds(sec)}
+        for h, sec in sorted(buckets.items())
+    ]
+
+
 def compute_screen_time_summary(
     afk_events,
     window_events,
     web_events_by_browser,
     window_start,
     window_end,
+    site_labels=None,
 ):
     """
     Computes exact screen time summary guaranteed to satisfy all 3 invariants.
@@ -377,8 +436,13 @@ def compute_screen_time_summary(
     - apps: list of {"app": str, "seconds": float}
     - browser_focus: dict of {browser_key: seconds}
     - browser_tabs: list of {"site": str, "browser": str, "seconds": float, "audible_seconds": float}
+    - labels: list of {"label": str, "seconds": float}, one label per second of
+      active window time (site_labels, Claude Code / <terminal>-shell, app name)
+    - hourly: list of {"start": local hour start (unix), "seconds": active seconds}
     - invariants_passed: bool
     """
+    if site_labels is None:
+        site_labels = DEFAULT_SITE_LABELS
     window_start, window_end = float(window_start), float(window_end)
     if not math.isfinite(window_start) or not math.isfinite(window_end) or window_end < window_start:
         raise ValueError("Activity window must have finite, ordered boundaries")
@@ -497,12 +561,15 @@ def compute_screen_time_summary(
 
     # Aggregate by app
     app_durations = {}
+    label_durations = {}
     for s, e, da, _ in active_window_ivs:
         app = str(da.get("app") or "(unfocused/desktop)").strip()
         if not app:
             app = "(unfocused/desktop)"
         dur = e - s
         app_durations[app] = app_durations.get(app, 0.0) + dur
+        label = window_label(app, da.get("title"))
+        label_durations[label] = label_durations.get(label, 0.0) + dur
 
     # Sort apps descending
     apps_list = [
@@ -533,11 +600,19 @@ def compute_screen_time_summary(
             site_audible = {}
             site_title = {}
 
-            for s, e, dw, _ in site_active:
+            for s, e, dw, dwin in site_active:
                 dur = e - s
                 url = dw.get("url") or ""
                 title = dw.get("title") if isinstance(dw.get("title"), str) else ""
                 site = extract_site_domain(url, title)
+
+                listed = site_label(site, site_labels)
+                if listed:
+                    # Move this time from the browser's own label to the site's.
+                    browser_label = window_label(
+                        str(dwin.get("app") or "").strip(), dwin.get("title"))
+                    label_durations[browser_label] = label_durations.get(browser_label, 0.0) - dur
+                    label_durations[listed] = label_durations.get(listed, 0.0) + dur
 
                 site_dur[site] = site_dur.get(site, 0.0) + dur
                 if title and (site not in site_title or not site_title[site]):
@@ -583,6 +658,12 @@ def compute_screen_time_summary(
         "apps": apps_list,
         "browser_focus": {k: duration_seconds(v) for k, v in browser_focus.items()},
         "browser_tabs": browser_tabs_list,
+        "labels": [
+            {"label": label, "seconds": duration_seconds(max(0.0, sec))}
+            for label, sec in sorted(label_durations.items(), key=lambda x: x[1], reverse=True)
+            if sec > 0.5
+        ],
+        "hourly": hourly_seconds(active_ivs),
         "invariants_passed": invariants_passed,
     }
 
