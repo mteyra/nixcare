@@ -4,6 +4,7 @@ Full notes for each version are on the [releases page](https://github.com/mteyra
 
 ## Unreleased
 
+- Screen-time labels: `laptop-report --json` now also has `labels` (one flat list where every active second has exactly one label: sites from the new `track.siteLabels` option, `Claude Code` / `<terminal>-shell` for terminals, otherwise the app name) and `hourly` (active seconds per local clock hour).
 - The tracking collector and `laptop-report` now live in their own Python files (`modules/laptop_telemetry.py`, `modules/laptop_report.py`) instead of inside `track.nix`, so the tests run the real code and linters check it. Settings reach them as command-line options. No behavior changes.
 - Removed unused imports and variables flagged by linting. No behavior changes.
 - README: status badges, clearer note on `nix profile install` for older Nix, changelog link.

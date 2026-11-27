@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 
 from activity_intersector import (
     BROWSER_FAMILIES,
+    DEFAULT_SITE_LABELS,
     compute_screen_time_summary,
     duration_seconds,
     extract_site_domain,
@@ -101,6 +102,7 @@ DB_PATH = "/var/lib/laptop-telemetry/telemetry.db"
 OWNER_USER = ""
 RETENTION_DAYS = 90
 ACTIVITY_ENABLED = False
+SITE_LABELS = dict(DEFAULT_SITE_LABELS)
 NVME_BIN = "nvme"
 PORT = 5601
 SAMPLE_INTERVAL = 5.0
@@ -738,6 +740,7 @@ def _build_summary(conn, hours=24.0):
             web_events_by_browser=web_by_browser,
             window_start=since,
             window_end=now_ts,
+            site_labels=SITE_LABELS,
         )
         if not aw_summary.get("active_measurement_available", True):
             raise ValueError("No idle/active evidence in the requested window")
@@ -747,6 +750,8 @@ def _build_summary(conn, hours=24.0):
             activity_warning = "ActivityWatch unavailable or incomplete; using sampled activity: " + str(error)
 
     activity_source = "disabled" if not ACTIVITY_ENABLED else "telemetry-samples"
+    labels = []
+    hourly = []
     if aw_summary and (aw_summary.get("total_tracked_seconds", 0) > 0 or aw_summary.get("active_screen_seconds", 0) > 0):
         activity_source = "activitywatch"
         total_tracked_seconds = aw_summary["total_tracked_seconds"]
@@ -762,6 +767,8 @@ def _build_summary(conn, hours=24.0):
             "sleep_blocks": aw_summary.get("sleep_blocks", []),
         }
 
+        labels = aw_summary.get("labels", [])
+        hourly = aw_summary.get("hourly", [])
         apps = []
         for a in aw_summary["apps"]:
             st = app_stats.get(a["app"], {})
@@ -952,6 +959,8 @@ def _build_summary(conn, hours=24.0):
         },
         "apps": apps,
         "browser_tabs": tabs,
+        "labels": labels or [{"label": a["app"], "seconds": a["seconds"]} for a in apps],
+        "hourly": hourly,
         "top_cpu_processes": top_cpu_procs,
         "top_io_processes": top_io_procs,
     }
@@ -1182,6 +1191,8 @@ def parse_args(argv=None):
     ap.add_argument("--user", required=True, help="desktop user whose ActivityWatch data is read")
     ap.add_argument("--retention-days", type=int, default=RETENTION_DAYS, help="days of samples to keep (default: %(default)s)")
     ap.add_argument("--activity", action="store_true", help="include app, window and browser activity from ActivityWatch")
+    ap.add_argument("--site-labels", type=json.loads, default=None, metavar="JSON",
+                    help="sites with their own screen-time label, {\"domain\": \"Label\"} (default: the built-in list)")
     ap.add_argument("--nvme", default=NVME_BIN, help="nvme-cli binary used for disk wear (default: %(default)s on PATH)")
     args = ap.parse_args(argv)
     if args.retention_days < 1:
@@ -1190,11 +1201,13 @@ def parse_args(argv=None):
 
 
 def apply_settings(args):
-    global OWNER_USER, RETENTION_DAYS, ACTIVITY_ENABLED, NVME_BIN
+    global OWNER_USER, RETENTION_DAYS, ACTIVITY_ENABLED, NVME_BIN, SITE_LABELS
     OWNER_USER = args.user
     RETENTION_DAYS = args.retention_days
     ACTIVITY_ENABLED = args.activity
     NVME_BIN = args.nvme
+    if args.site_labels is not None:
+        SITE_LABELS = {str(k): str(v) for k, v in dict(args.site_labels).items()}
 
 
 def main(argv=None):
